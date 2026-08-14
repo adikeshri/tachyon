@@ -160,9 +160,18 @@ impl MemTable {
         self.live == 0
     }
 
-    /// Approximate heap footprint of the stored documents.
+    /// Approximate heap footprint of everything this memtable holds.
+    ///
+    /// The stored documents are only part of it — the inverted index is
+    /// routinely the larger half, since it holds a posting per distinct term
+    /// per field per document. Reporting the documents alone would understate
+    /// a collection's real memory by a wide margin, which matters because this
+    /// figure is both the `/metrics` gauge an operator watches and the number
+    /// `max_memtable_bytes` is compared against to decide when to flush.
+    ///
+    /// Every component is a running total, so this stays O(1).
     pub fn heap_bytes(&self) -> usize {
-        self.heap_bytes
+        self.heap_bytes + self.index.heap_bytes() + self.columns.heap_bytes()
     }
 
     /// Every live document, in doc id order.
@@ -323,8 +332,37 @@ mod tests {
         let id = m.insert(doc("a", "a fairly long title to make the delta obvious"));
         let after_insert = m.heap_bytes();
         assert!(after_insert > 0);
+
         m.remove(id);
-        assert_eq!(m.heap_bytes(), 0);
+        let after_remove = m.heap_bytes();
+        assert!(after_remove < after_insert, "removing a document must free its stored form");
+        // …but not all of it: a deleted document's postings stay in the
+        // inverted index until the memtable is flushed, and the flush decision
+        // this figure feeds has to account for memory that is still held.
+        assert!(after_remove > 0, "postings survive the delete and must still be counted");
+    }
+
+    #[test]
+    fn heap_accounting_covers_the_index_not_just_the_documents() {
+        // The inverted index is typically the larger half of a memtable, so a
+        // figure that ignored it would let a collection grow well past
+        // `max_memtable_bytes` before anything decided to flush.
+        let mut sparse = memtable(0);
+        let mut wordy = memtable(0);
+
+        // Same number of documents and near-identical stored size; one has far
+        // more distinct terms to index.
+        for i in 0..50 {
+            sparse.insert(doc(&format!("{i}"), "aa aa aa aa aa aa aa aa"));
+            wordy.insert(doc(&format!("{i}"), &format!("t{i}a t{i}b t{i}c t{i}d t{i}e t{i}f")));
+        }
+
+        assert!(
+            wordy.heap_bytes() > sparse.heap_bytes(),
+            "index size must move the total: {} vs {}",
+            wordy.heap_bytes(),
+            sparse.heap_bytes()
+        );
     }
 
     #[test]

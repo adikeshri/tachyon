@@ -130,9 +130,7 @@ pub fn suggest(ctx: &SearchContext, req: &SuggestRequest) -> Vec<Suggestion> {
     // Completions of exactly what was typed.
     let mut prefix_terms = Vec::new();
     for source in &ctx.sources {
-        let before = prefix_terms.len();
-        source.collect_terms_with_prefix(&req.prefix, &mut prefix_terms);
-        prefix_terms.truncate(before + MAX_SUGGEST_CANDIDATES);
+        source.collect_terms_with_prefix(&req.prefix, MAX_SUGGEST_CANDIDATES, &mut prefix_terms);
     }
     candidates.extend(prefix_terms.into_iter().map(|term| (term, 0)));
 
@@ -157,16 +155,24 @@ pub fn suggest(ctx: &SearchContext, req: &SuggestRequest) -> Vec<Suggestion> {
     // Rank cheaply first, on posting-list length, and keep a working set a few
     // times the page. Counting *live* documents means walking posting lists, so
     // it is worth doing for a few dozen terms and not for a thousand.
-    candidates.sort_by(|a, b| {
-        a.1.cmp(&b.1)
-            .then_with(|| raw_freq(ctx, req, &b.0).cmp(&raw_freq(ctx, req, &a.0)))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    candidates.truncate(req.limit * 4 + 16);
-
-    let mut suggestions: Vec<Suggestion> = candidates
+    //
+    // The frequency is attached to each term before sorting rather than read
+    // inside the comparator: a comparator runs O(n log n) times, and this one
+    // would have done a term-dictionary lookup per source per field on every
+    // call — thousands of lookups to order a few hundred candidates.
+    let mut ranked: Vec<(u32, u64, String)> = candidates
         .into_iter()
-        .map(|(term, typos)| {
+        .map(|(term, typos)| (typos, raw_freq(ctx, req, &term), term))
+        .collect();
+    ranked.sort_by(|a, b| {
+        // Fewest edits first, then most documents, then alphabetically.
+        a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2))
+    });
+    ranked.truncate(req.limit * 4 + 16);
+
+    let mut suggestions: Vec<Suggestion> = ranked
+        .into_iter()
+        .map(|(typos, _, term)| {
             let mut count = 0u64;
             for source in &ctx.sources {
                 for field in &req.fields {

@@ -33,7 +33,7 @@ use std::cmp::Ordering;
 use roaring::RoaringBitmap;
 
 use tachyon_core::{CollectionSchema, DocId, FieldId, Value};
-use tachyon_index::{FuzzyMatcher, IndexSource};
+use tachyon_index::{FieldPostings, FuzzyMatcher, IndexSource};
 
 use crate::bm25::{self, FieldStats};
 use crate::filter;
@@ -116,11 +116,6 @@ impl<'a> SearchContext<'a> {
         FieldStats::new(doc_count, total_len)
     }
 
-    /// Global document frequency for a term in a field.
-    fn doc_freq(&self, term: &str, field: FieldId) -> u32 {
-        self.sources.iter().map(|s| s.doc_freq(term, field)).sum()
-    }
-
     fn value(&self, doc_id: DocId, field: FieldId) -> Option<&Value> {
         self.sources.iter().find_map(|s| {
             (doc_id >= s.min_doc_id() && doc_id < s.end_doc_id()).then(|| s.value(doc_id, field))?
@@ -189,26 +184,45 @@ impl Accumulator {
         }
     }
 
-    fn block(&self) -> usize {
-        self.num_fields * self.num_tokens
+    /// Slot for a document, appending a fresh block the first time it is seen.
+    ///
+    /// One hash lookup, not the two a `get` followed by an `insert` would cost:
+    /// this runs once per posting on a broad query, which is the single most
+    /// executed line in a search.
+    fn slot(&mut self, doc_id: DocId) -> usize {
+        let next = self.docs.len() as u32;
+        match self.index.entry(doc_id) {
+            std::collections::hash_map::Entry::Occupied(existing) => *existing.get() as usize,
+            std::collections::hash_map::Entry::Vacant(empty) => {
+                empty.insert(next);
+                self.docs.push(doc_id);
+
+                let block = self.num_fields * self.num_tokens;
+                self.scores.resize(self.scores.len() + block, 0.0);
+                self.edits.resize(self.edits.len() + block, UNMATCHED);
+                if self.needs_positions {
+                    self.positions.resize(self.positions.len() + block, Vec::new());
+                }
+                next as usize
+            }
+        }
     }
 
-    /// Slot for a document, appending a fresh block the first time it is seen.
-    fn slot(&mut self, doc_id: DocId) -> usize {
-        if let Some(slot) = self.index.get(&doc_id) {
-            return *slot as usize;
+    /// Put every position list into the sorted, deduplicated form the phrase
+    /// and proximity checks need.
+    ///
+    /// Done once, after the walk, rather than on each read: a position list is
+    /// read once per field per phrase token and again for proximity, and
+    /// sorting a fresh clone every time was the largest cost in scoring a
+    /// multi-token query. Positions arrive out of order because one token can
+    /// expand into several terms, each contributing its own occurrences.
+    fn normalize_positions(&mut self) {
+        for list in &mut self.positions {
+            if list.len() > 1 {
+                list.sort_unstable();
+                list.dedup();
+            }
         }
-        let slot = self.docs.len();
-        self.index.insert(doc_id, slot as u32);
-        self.docs.push(doc_id);
-
-        let block = self.block();
-        self.scores.resize(self.scores.len() + block, 0.0);
-        self.edits.resize(self.edits.len() + block, UNMATCHED);
-        if self.needs_positions {
-            self.positions.resize(self.positions.len() + block, Vec::new());
-        }
-        slot
     }
 
     fn cell(&self, slot: usize, field: usize, token: usize) -> usize {
@@ -237,14 +251,14 @@ impl Accumulator {
     }
 
     /// Sorted, deduplicated positions of one token in one field.
-    fn token_positions(&self, slot: usize, field: usize, token: usize) -> Vec<u32> {
+    ///
+    /// Valid only after [`Accumulator::normalize_positions`]; borrowed rather
+    /// than cloned, so reading a position list costs nothing.
+    fn token_positions(&self, slot: usize, field: usize, token: usize) -> &[u32] {
         if !self.needs_positions {
-            return Vec::new();
+            return &[];
         }
-        let mut sorted = self.positions[self.cell(slot, field, token)].clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        sorted
+        &self.positions[self.cell(slot, field, token)]
     }
 
     fn len(&self) -> usize {
@@ -288,6 +302,10 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
     let needs_positions = tokens.len() > 1 || !query.phrases.is_empty();
     let mut acc = Accumulator::new(req.query_by.len(), tokens.len(), needs_positions);
 
+    // Reused across candidates so resolving a term against every source does
+    // not allocate per candidate.
+    let mut per_source: Vec<Option<&FieldPostings>> = Vec::with_capacity(ctx.sources.len());
+
     for (field_pos, &(field, _boost)) in req.query_by.iter().enumerate() {
         let stats = ctx.field_stats(field);
         if stats.doc_count == 0 {
@@ -296,10 +314,21 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
 
         for (token_idx, candidates) in expansions.iter().enumerate() {
             for candidate in candidates {
-                let idf = bm25::idf(ctx.doc_freq(&candidate.term, field), stats.doc_count);
+                // Resolve the term in each source once. Asking for the document
+                // frequency and then for the postings would walk every source's
+                // term dictionary twice for the same term.
+                per_source.clear();
+                per_source.extend(ctx.sources.iter().map(|s| s.postings(&candidate.term, field)));
 
-                for source in &ctx.sources {
-                    let Some(postings) = source.postings(&candidate.term, field) else {
+                let doc_freq: u32 =
+                    per_source.iter().map(|p| p.map_or(0, FieldPostings::doc_freq)).sum();
+                if doc_freq == 0 {
+                    continue;
+                }
+                let idf = bm25::idf(doc_freq, stats.doc_count);
+
+                for (source, postings) in ctx.sources.iter().zip(per_source.iter()) {
+                    let Some(postings) = postings else {
                         continue;
                     };
                     for posting in &postings.docs {
@@ -335,6 +364,7 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
         }
     }
 
+    acc.normalize_positions();
     finish(ctx, req, &query, acc)
 }
 
@@ -356,9 +386,16 @@ fn finish(
         MatchMode::Any => 1,
     };
 
+    let num_fields = req.query_by.len();
     let mut candidates: Vec<Ranked> = Vec::new();
-    let mut matched = RoaringBitmap::new();
-    let mut found = 0usize;
+    // Gathered flat and turned into a bitmap at the end. Documents are visited
+    // in postings-walk order, which is not doc id order, and inserting an
+    // unordered run into a roaring bitmap shifts elements inside its container
+    // on nearly every call — a real cost when a broad query matches thousands
+    // of documents, and this set is built on every search that facets.
+    let mut matched_ids: Vec<DocId> = Vec::new();
+    // Reused across documents so scoring allocates once, not once per hit.
+    let mut present: Vec<&[u32]> = Vec::with_capacity(tokens.len());
 
     for slot in 0..acc.len() {
         let doc_id = acc.docs[slot];
@@ -367,7 +404,7 @@ fn finish(
         // title and "mouse" in the description is still a match for
         // "wireless mouse".
         let union = (0..tokens.len())
-            .filter(|token| (0..req.query_by.len()).any(|f| acc.matched(slot, f, *token)))
+            .filter(|token| (0..num_fields).any(|f| acc.matched(slot, f, *token)))
             .count();
         if union < required {
             continue;
@@ -379,25 +416,29 @@ fn finish(
             continue;
         }
 
-        found += 1;
-        matched.insert(doc_id);
+        matched_ids.push(doc_id);
 
         // Pick the field that best explains this match.
         let mut best_field = 0usize;
-        let mut best_score = f32::NEG_INFINITY;
-        for field_pos in 0..req.query_by.len() {
-            let boosted = acc.field_bm25(slot, field_pos) * req.query_by[field_pos].1;
-            if boosted > best_score {
-                best_score = boosted;
+        let mut best_bm25 = 0.0f32;
+        let mut best_boosted = f32::NEG_INFINITY;
+        for field_pos in 0..num_fields {
+            let raw = acc.field_bm25(slot, field_pos);
+            let boosted = raw * req.query_by[field_pos].1;
+            if boosted > best_boosted {
+                best_boosted = boosted;
+                best_bm25 = raw;
                 best_field = field_pos;
             }
         }
 
         // Proximity is only meaningful over the tokens this field actually has.
-        let present: Vec<Vec<u32>> = (0..tokens.len())
-            .filter(|token| acc.matched(slot, best_field, *token))
-            .map(|token| acc.token_positions(slot, best_field, token))
-            .collect();
+        present.clear();
+        present.extend(
+            (0..tokens.len())
+                .filter(|token| acc.matched(slot, best_field, *token))
+                .map(|token| acc.token_positions(slot, best_field, token)),
+        );
 
         let matched_here = acc.field_matched_tokens(slot, best_field);
         let proximity = if matched_here == tokens.len() {
@@ -414,7 +455,7 @@ fn finish(
             .unwrap_or(0.0);
 
         let components = ScoreComponents {
-            bm25: score::normalize_bm25(acc.field_bm25(slot, best_field)),
+            bm25: score::normalize_bm25(best_bm25),
             field_boost: score::normalize_field_boost(req.query_by[best_field].1, max_boost),
             proximity,
             typo_penalty: score::typo_penalty(acc.field_edits(slot, best_field), allowed_edits),
@@ -430,8 +471,29 @@ fn finish(
         });
     }
 
+    // A document reaches this point at most once, so the count is exact and no
+    // deduplication is needed.
+    let found = matched_ids.len();
+    let matched = sorted_bitmap(matched_ids);
+
     let hits = paginate(req, candidates);
     SearchOutcome { found, hits, matched }
+}
+
+/// Build a bitmap from doc ids in arbitrary order, sorting first so the fill
+/// is linear rather than an insert-and-shift per element.
+///
+/// Worth it because a result set is sparse: roaring holds it in array
+/// containers, where an out-of-order insert shifts the tail of the container.
+/// The same trick loses on a dense set — see `collect_docs` in the index
+/// crate's columns, which deliberately does not sort.
+fn sorted_bitmap(mut doc_ids: Vec<DocId>) -> RoaringBitmap {
+    if doc_ids.is_empty() {
+        return RoaringBitmap::new();
+    }
+    doc_ids.sort_unstable();
+    doc_ids.dedup();
+    RoaringBitmap::from_sorted_iter(doc_ids).expect("doc ids were sorted and deduplicated")
 }
 
 /// An empty query matches every live document, so filters and sorting can be
@@ -493,6 +555,14 @@ fn sort_values(
 /// only the window itself is fully sorted, so a query matching a million
 /// documents does not pay to order all of them.
 fn paginate(req: &SearchRequest, mut candidates: Vec<Ranked>) -> Vec<ScoredDoc> {
+    let window = req.window();
+    if window == 0 {
+        // `limit=0` asks for no documents. Ordering a whole collection to
+        // return none of it is pure waste, and it is exactly the request an
+        // impatient caller sends to read `found` alone.
+        return Vec::new();
+    }
+
     let clauses: &[SortClause] = req.sort_clauses.as_deref().unwrap_or(&[]);
     let compare = |a: &Ranked, b: &Ranked| -> Ordering {
         if clauses.is_empty() {
@@ -503,8 +573,7 @@ fn paginate(req: &SearchRequest, mut candidates: Vec<Ranked>) -> Vec<ScoredDoc> 
         }
     };
 
-    let window = req.window();
-    if candidates.len() > window && window > 0 {
+    if candidates.len() > window {
         candidates.select_nth_unstable_by(window - 1, compare);
         candidates.truncate(window);
     }
@@ -541,11 +610,10 @@ fn phrase_in_field(acc: &Accumulator, slot: usize, field: usize, start: usize, e
 
     // Walk the first token's positions; each is a candidate phrase start.
     let first = acc.token_positions(slot, field, start);
-    let rest: Vec<Vec<u32>> =
-        (start + 1..=end).map(|token| acc.token_positions(slot, field, token)).collect();
 
     first.iter().any(|&anchor| {
-        rest.iter().enumerate().all(|(offset, positions)| {
+        (start + 1..=end).enumerate().all(|(offset, token)| {
+            let positions = acc.token_positions(slot, field, token);
             anchor
                 .checked_add(offset as u32 + 1)
                 .is_some_and(|expected| positions.binary_search(&expected).is_ok())
@@ -589,7 +657,11 @@ fn expand_token(
     if req.prefix && expand_prefix {
         let mut terms = Vec::new();
         for source in &ctx.sources {
-            source.collect_terms_with_prefix(token, &mut terms);
+            // Bounded per source, not just after merging: the merge keeps the
+            // alphabetically first `MAX_TERM_EXPANSIONS` terms, and every one
+            // of those is within the first `MAX_TERM_EXPANSIONS` of the source
+            // it came from, so capping here cannot change the result.
+            source.collect_terms_with_prefix(token, MAX_TERM_EXPANSIONS, &mut terms);
         }
         terms.sort_unstable();
         terms.dedup();
@@ -842,6 +914,17 @@ mod tests {
         let b = f.search(query("mouse"));
         assert_eq!(f.ids(&a), f.ids(&b));
         assert_eq!(a.hits[0].score, b.hits[0].score);
+    }
+
+    #[test]
+    fn a_zero_limit_still_reports_the_total() {
+        // `limit=0` short-circuits ranking entirely, so the counts it does
+        // report have to be the ones a normal request would have produced.
+        let f = corpus();
+        let out = f.search(SearchParams { limit: Some(0), ..query("mouse") });
+        assert!(out.hits.is_empty());
+        assert_eq!(out.found, 2, "the total is independent of the page size");
+        assert_eq!(out.matched.len(), 2, "and faceting still sees every match");
     }
 
     #[test]

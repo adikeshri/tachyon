@@ -121,7 +121,7 @@ pub fn max_boost(schema: &CollectionSchema) -> f32 {
 /// adjacent, `n - 1`) to the smallest window actually containing one
 /// occurrence of every token: 1.0 for an exact phrase, decaying as the terms
 /// spread out.
-pub fn proximity(positions: &[Vec<u32>]) -> f32 {
+pub fn proximity(positions: &[&[u32]]) -> f32 {
     let n = positions.len();
     if n <= 1 {
         // A single term is trivially adjacent to itself.
@@ -145,7 +145,7 @@ pub fn proximity(positions: &[Vec<u32>]) -> f32 {
 ///
 /// Standard k-way sweep: advance the list whose current position is smallest,
 /// since that is the only move that can shrink the window.
-fn min_window_span(positions: &[Vec<u32>]) -> Option<u32> {
+fn min_window_span(positions: &[&[u32]]) -> Option<u32> {
     let mut cursors = vec![0usize; positions.len()];
     let mut best = u32::MAX;
 
@@ -235,15 +235,15 @@ mod tests {
     #[test]
     fn adjacent_terms_score_a_perfect_proximity() {
         // "wireless mouse" at positions 3 and 4.
-        assert_eq!(proximity(&[vec![3], vec![4]]), 1.0);
+        assert_eq!(proximity(&[&[3], &[4]]), 1.0);
         // Three adjacent terms.
-        assert_eq!(proximity(&[vec![0], vec![1], vec![2]]), 1.0);
+        assert_eq!(proximity(&[&[0], &[1], &[2]]), 1.0);
     }
 
     #[test]
     fn spread_out_terms_score_lower() {
-        let tight = proximity(&[vec![0], vec![1]]);
-        let loose = proximity(&[vec![0], vec![10]]);
+        let tight = proximity(&[&[0], &[1]]);
+        let loose = proximity(&[&[0], &[10]]);
         assert!(tight > loose, "{tight} vs {loose}");
         assert!(loose > 0.0);
     }
@@ -251,14 +251,14 @@ mod tests {
     #[test]
     fn proximity_finds_the_best_window_among_repeats() {
         // "mouse" at 0 and 50, "pad" at 51: the best window is 50..51.
-        assert_eq!(proximity(&[vec![0, 50], vec![51]]), 1.0);
+        assert_eq!(proximity(&[&[0, 50], &[51]]), 1.0);
     }
 
     #[test]
     fn proximity_edge_cases() {
         assert_eq!(proximity(&[]), 1.0, "no terms is not a penalty");
-        assert_eq!(proximity(&[vec![7]]), 1.0, "one term is trivially adjacent");
-        assert_eq!(proximity(&[vec![1], vec![]]), 0.0, "a missing term scores zero");
+        assert_eq!(proximity(&[&[7]]), 1.0, "one term is trivially adjacent");
+        assert_eq!(proximity(&[&[1][..], &[][..]]), 0.0, "a missing term scores zero");
     }
 
     #[test]

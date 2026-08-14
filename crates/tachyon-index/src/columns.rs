@@ -73,6 +73,59 @@ impl NumKey {
     }
 }
 
+/// One end of a numeric range, and whether the endpoint itself is included.
+#[derive(Debug, Clone, Copy)]
+struct Bound {
+    key: NumKey,
+    inclusive: bool,
+}
+
+impl Bound {
+    fn inclusive(key: NumKey) -> Bound {
+        Bound { key, inclusive: true }
+    }
+
+    fn exclusive(key: NumKey) -> Bound {
+        Bound { key, inclusive: false }
+    }
+
+    /// Whether `value` clears this bound treated as a lower one.
+    fn admits_low(self, value: &NumKey) -> bool {
+        let order = value.cmp_key(&self.key);
+        if self.inclusive {
+            order.is_ge()
+        } else {
+            order.is_gt()
+        }
+    }
+
+    /// Whether `value` clears this bound treated as an upper one.
+    fn admits_high(self, value: &NumKey) -> bool {
+        let order = value.cmp_key(&self.key);
+        if self.inclusive {
+            order.is_le()
+        } else {
+            order.is_lt()
+        }
+    }
+}
+
+/// Build a bitmap from doc ids arriving in `(value, doc_id)` order, which is
+/// not doc id order.
+///
+/// Deliberately a plain `insert` per id rather than a sort followed by
+/// `from_sorted_iter`. Sorting first is the obvious optimization and it is a
+/// loss here, measurably: the selections these columns produce are dense
+/// enough that roaring stores them as bitmap containers, where an out-of-order
+/// insert is a single bit-set and the sort buys nothing but its own `n log n`.
+/// Benchmarked at 200k documents, sorting made a range filter ~17% slower.
+///
+/// Somewhere sparse, that trade would flip — see `sorted_bitmap` in the query
+/// executor, which does sort, for a set where it pays off.
+fn collect_docs(docs: impl Iterator<Item = DocId>) -> RoaringBitmap {
+    docs.collect()
+}
+
 /// Sorted `(value, doc_id)` pairs for one numeric field.
 #[derive(Debug, Default)]
 pub struct NumericColumn {
@@ -127,53 +180,76 @@ impl NumericColumn {
         self.len() == 0
     }
 
-    /// Documents whose value satisfies `predicate`, where `predicate` must be
-    /// monotonic in the value — every range comparison is.
-    fn select(&self, mut predicate: impl FnMut(NumKey) -> bool, out: &mut RoaringBitmap) {
-        for (key, doc_id) in self.sorted.iter().chain(self.pending.iter()) {
-            if predicate(*key) {
-                out.insert(*doc_id);
-            }
-        }
+    /// Documents whose value satisfies `predicate`.
+    fn select(&self, mut predicate: impl FnMut(NumKey) -> bool) -> RoaringBitmap {
+        let matches = self
+            .sorted
+            .iter()
+            .chain(self.pending.iter())
+            .filter(|(key, _)| predicate(*key))
+            .map(|(_, doc_id)| *doc_id);
+        collect_docs(matches)
     }
 
-    /// Documents with a value in `[lo, hi]`, either bound optional.
+    /// Documents with a value between the given bounds.
     ///
     /// The sorted region is bounded by binary search so only the matching
-    /// slice is touched; the pending tail is short enough to scan.
-    pub fn range(&self, lo: Option<NumKey>, hi: Option<NumKey>) -> RoaringBitmap {
-        let mut out = RoaringBitmap::new();
-
+    /// slice is touched; the pending tail is short enough to scan. Each bound
+    /// carries whether it is inclusive, so a strict comparison is one pass and
+    /// not a range scan minus an equality scan.
+    fn bounded(&self, lo: Option<Bound>, hi: Option<Bound>) -> RoaringBitmap {
+        // `partition_point` needs the predicate to be false-then-true across
+        // the region, which holds because `sorted` is ordered by key.
         let start = match lo {
-            Some(lo) => self.sorted.partition_point(|(k, _)| k.cmp_key(&lo).is_lt()),
+            Some(Bound { key, inclusive: true }) => {
+                self.sorted.partition_point(|(k, _)| k.cmp_key(&key).is_lt())
+            }
+            Some(Bound { key, inclusive: false }) => {
+                self.sorted.partition_point(|(k, _)| k.cmp_key(&key).is_le())
+            }
             None => 0,
         };
         let end = match hi {
-            Some(hi) => self.sorted.partition_point(|(k, _)| k.cmp_key(&hi).is_le()),
+            Some(Bound { key, inclusive: true }) => {
+                self.sorted.partition_point(|(k, _)| k.cmp_key(&key).is_le())
+            }
+            Some(Bound { key, inclusive: false }) => {
+                self.sorted.partition_point(|(k, _)| k.cmp_key(&key).is_lt())
+            }
             None => self.sorted.len(),
         };
-        for (_, doc_id) in &self.sorted[start.min(end)..end] {
-            out.insert(*doc_id);
-        }
 
-        for (key, doc_id) in &self.pending {
-            let above = lo.is_none_or(|lo| key.cmp_key(&lo).is_ge());
-            let below = hi.is_none_or(|hi| key.cmp_key(&hi).is_le());
-            if above && below {
-                out.insert(*doc_id);
-            }
-        }
+        let within = |key: &NumKey| {
+            lo.is_none_or(|lo| lo.admits_low(key)) && hi.is_none_or(|hi| hi.admits_high(key))
+        };
+        let selected = self.sorted[start.min(end)..end]
+            .iter()
+            .map(|(_, doc_id)| *doc_id)
+            .chain(self.pending.iter().filter(|(key, _)| within(key)).map(|(_, doc_id)| *doc_id));
 
-        out
+        collect_docs(selected)
+    }
+
+    /// Documents with a value in `[lo, hi]`, either bound optional.
+    pub fn range(&self, lo: Option<NumKey>, hi: Option<NumKey>) -> RoaringBitmap {
+        self.bounded(lo.map(Bound::inclusive), hi.map(Bound::inclusive))
+    }
+
+    /// Documents with a value strictly below `key`.
+    pub fn less_than(&self, key: NumKey) -> RoaringBitmap {
+        self.bounded(None, Some(Bound::exclusive(key)))
+    }
+
+    /// Documents with a value strictly above `key`.
+    pub fn greater_than(&self, key: NumKey) -> RoaringBitmap {
+        self.bounded(Some(Bound::exclusive(key)), None)
     }
 
     /// Documents whose value differs from `key`. Distinct from
     /// `!range(key, key)`: a document with no value at all is not "not equal",
     /// it is absent, and the caller decides what that means.
     pub fn not_equal(&self, key: NumKey) -> RoaringBitmap {
-        let mut out = RoaringBitmap::new();
-        self.select(|k| k.cmp_key(&key) != Ordering::Equal, &mut out);
-        out
+        self.select(|k| k.cmp_key(&key) != Ordering::Equal)
     }
 
     /// Distinct values with their document counts, restricted to a result set.
@@ -210,9 +286,7 @@ impl NumericColumn {
 
     /// Every document with any value in this column.
     pub fn present(&self) -> RoaringBitmap {
-        let mut out = RoaringBitmap::new();
-        self.select(|_| true, &mut out);
-        out
+        self.select(|_| true)
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -227,11 +301,29 @@ pub struct KeywordColumn {
     /// Documents with any value, so `!=` can exclude without resurrecting
     /// documents that simply lack the field.
     present: RoaringBitmap,
+    /// Running totals for [`KeywordColumn::heap_bytes`]: the distinct value
+    /// text, and how many `(value, document)` pairs the bitmaps hold.
+    value_bytes: usize,
+    entries: usize,
 }
 
 impl KeywordColumn {
     pub fn push(&mut self, value: &str, doc_id: DocId) {
-        self.by_value.entry(Box::from(value)).or_default().insert(doc_id);
+        // Looked up before it is owned: `entry` would allocate a `Box<str>` on
+        // every call, and a keyword column exists precisely because its values
+        // repeat — a brand column over a million documents holds a few dozen
+        // distinct strings, so all but a few dozen of those allocations are
+        // built only to be thrown away.
+        let added = match self.by_value.get_mut(value) {
+            Some(docs) => docs.insert(doc_id),
+            None => {
+                self.value_bytes += value.len() + std::mem::size_of::<Box<str>>() + 32;
+                self.by_value.entry(Box::from(value)).or_default().insert(doc_id)
+            }
+        };
+        if added {
+            self.entries += 1;
+        }
         self.present.insert(doc_id);
     }
 
@@ -267,8 +359,12 @@ impl KeywordColumn {
         self.by_value.len()
     }
 
+    /// Rough heap footprint. O(1): `serialized_size` would have to be asked of
+    /// every bitmap, and this is consulted to decide when to flush, so it
+    /// tracks running totals and treats each `(value, document)` pair as a
+    /// bare `DocId` — an upper bound, since roaring compresses dense runs.
     pub fn heap_bytes(&self) -> usize {
-        self.by_value.iter().map(|(v, docs)| v.len() + 32 + docs.serialized_size()).sum()
+        self.value_bytes + self.entries * std::mem::size_of::<DocId>()
     }
 }
 
@@ -393,6 +489,35 @@ mod tests {
             .map(|i| i as DocId)
             .collect();
         assert_eq!(ids(&selected), expected);
+    }
+
+    #[test]
+    fn strict_comparisons_exclude_the_endpoint() {
+        let c = column_of(&[(10, 0), (20, 1), (20, 2), (30, 3)]);
+        assert_eq!(ids(&c.less_than(NumKey::Int(20))), vec![0]);
+        assert_eq!(ids(&c.greater_than(NumKey::Int(20))), vec![3]);
+        // Nothing matches below the minimum or above the maximum.
+        assert!(c.less_than(NumKey::Int(10)).is_empty());
+        assert!(c.greater_than(NumKey::Int(30)).is_empty());
+    }
+
+    #[test]
+    fn strict_comparisons_agree_with_the_inclusive_ones_across_the_merge_boundary() {
+        // The bounds are resolved by binary search over the sorted region and
+        // by predicate over the pending tail; both halves must agree.
+        let mut c = NumericColumn::default();
+        let total = MERGE_THRESHOLD + 313;
+        for i in 0..total {
+            c.push(NumKey::Int(((i * 31) % 97) as i64), i as DocId);
+        }
+
+        for pivot in [0i64, 1, 48, 96, 200] {
+            let key = NumKey::Int(pivot);
+            let equal = c.range(Some(key), Some(key));
+
+            assert_eq!(c.less_than(key), &c.range(None, Some(key)) - &equal, "< {pivot}");
+            assert_eq!(c.greater_than(key), &c.range(Some(key), None) - &equal, "> {pivot}");
+        }
     }
 
     #[test]

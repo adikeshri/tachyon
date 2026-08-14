@@ -12,6 +12,8 @@
 //! At most [`MAX_FACET_VALUES`] values per field come back, the most common
 //! first, since a facet list nobody will scroll is just response weight.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Number, Value as Json};
 
 use roaring::RoaringBitmap;
@@ -38,32 +40,30 @@ pub fn compute(
         };
 
         // A value can occur in more than one source, so counts are summed by
-        // value rather than concatenated.
-        let mut counts: Vec<(String, u64)> = Vec::new();
-        let add = |value: String, count: u64, counts: &mut Vec<(String, u64)>| match counts
-            .iter_mut()
-            .find(|(existing, _)| *existing == value)
-        {
-            Some((_, total)) => *total += count,
-            None => counts.push((value, count)),
-        };
+        // value rather than concatenated. Keyed by value rather than searched
+        // linearly: a high-cardinality field has thousands of distinct values,
+        // and scanning the accumulated list per value made counting one facet
+        // quadratic in that cardinality.
+        let mut totals: HashMap<String, u64> = HashMap::new();
 
         for source in &ctx.sources {
             let columns = source.columns();
 
             if let Some(keyword) = columns.keyword(field) {
                 for (value, count) in keyword.value_counts_within(matched) {
-                    add(value.to_string(), count, &mut counts);
+                    *totals.entry(value.to_string()).or_default() += count;
                 }
             } else if let Some(numeric) = columns.numeric(field) {
                 for (key, count) in numeric.value_counts_within(matched) {
-                    add(format_key(key), count, &mut counts);
+                    *totals.entry(format_key(key)).or_default() += count;
                 }
             }
         }
 
-        // Most common first; ties break on the value so the list is stable.
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Most common first; ties break on the value so the list is stable
+        // regardless of the order the map happened to iterate in.
+        let mut counts: Vec<(String, u64)> = totals.into_iter().collect();
+        counts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         counts.truncate(MAX_FACET_VALUES);
 
         let mut values = Map::new();

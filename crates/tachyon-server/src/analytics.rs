@@ -23,7 +23,7 @@
 //! operational signal, not a system of record, and writing them down would put
 //! a disk write on the read path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -165,7 +165,10 @@ impl Analytics {
         }
 
         let key = (collection.to_string(), query.to_string());
-        if !inner.queries.contains_key(&key) && inner.queries.len() >= MAX_TRACKED_QUERIES {
+        // Length first: the map is under its cap for all but a vanishing
+        // fraction of calls, and testing that spares a hash lookup on the path
+        // every single search takes.
+        if inner.queries.len() >= MAX_TRACKED_QUERIES && !inner.queries.contains_key(&key) {
             inner.compact();
             if inner.queries.len() >= MAX_TRACKED_QUERIES {
                 inner.dropped_queries += 1;
@@ -270,7 +273,12 @@ impl Inner {
         // Everything sharing the median count is a possibility; if that was
         // all of them, nothing was dropped and the map must still shrink.
         if self.queries.len() >= MAX_TRACKED_QUERIES {
-            let keep: Vec<(String, String)> =
+            // A `HashSet`, not a `Vec`: membership is tested once per tracked
+            // query, and a linear scan over half the cap turned the fallback
+            // into tens of millions of string comparisons — under the write
+            // lock every search needs, triggered by exactly the flood of
+            // unique queries this path exists to survive.
+            let keep: HashSet<(String, String)> =
                 self.queries.keys().take(MAX_TRACKED_QUERIES / 2).cloned().collect();
             let before = self.queries.len();
             self.queries.retain(|key, _| keep.contains(key));

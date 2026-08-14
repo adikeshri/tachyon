@@ -124,12 +124,17 @@ impl SearchRequest {
             return Err(Error::query(format!("limit must be at most {MAX_LIMIT}, got {limit}")));
         }
         let offset = params.offset.unwrap_or(0);
-        if offset + limit > MAX_WINDOW {
+        // Checked, not plain, addition: both operands come straight off the
+        // query string, and `?offset=18446744073709551615` must be a 400 rather
+        // than an overflow panic in a debug build or a wrapped window in a
+        // release one.
+        let window = offset.checked_add(limit).filter(|window| *window <= MAX_WINDOW);
+        let Some(window) = window else {
             return Err(Error::query(format!(
-                "offset + limit must be at most {MAX_WINDOW}, got {}",
-                offset + limit
+                "offset + limit must be at most {MAX_WINDOW}, got {offset} + {limit}"
             )));
-        }
+        };
+        debug_assert!(window <= MAX_WINDOW);
 
         let facet_by = match params.facet.as_deref() {
             Some(list) => {
@@ -186,8 +191,12 @@ impl SearchRequest {
     }
 
     /// Documents to collect before paginating.
+    ///
+    /// [`SearchRequest::resolve`] has already bounded this by [`MAX_WINDOW`];
+    /// the saturating add covers a request assembled by hand, where wrapping
+    /// would silently produce a tiny window instead of an obvious error.
     pub fn window(&self) -> usize {
-        self.offset + self.limit
+        self.offset.saturating_add(self.limit)
     }
 }
 
@@ -270,6 +279,18 @@ mod tests {
         let ok = SearchParams { offset: Some(20), limit: Some(5), ..params(None) };
         let req = SearchRequest::resolve(ok, &schema()).unwrap();
         assert_eq!(req.window(), 25);
+    }
+
+    #[test]
+    fn a_pagination_window_that_would_overflow_is_rejected() {
+        // Both values come straight off the query string, so their sum must be
+        // a 400 rather than an arithmetic overflow.
+        let overflowing =
+            SearchParams { offset: Some(usize::MAX), limit: Some(10), ..params(None) };
+        assert!(SearchRequest::resolve(overflowing, &schema()).is_err());
+
+        let huge = SearchParams { offset: Some(usize::MAX), limit: Some(0), ..params(None) };
+        assert!(SearchRequest::resolve(huge, &schema()).is_err());
     }
 
     #[test]

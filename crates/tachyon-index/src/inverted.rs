@@ -91,11 +91,23 @@ struct FieldStats {
     total_len: u64,
 }
 
+/// Per-term dictionary overhead beyond the term text itself: the `Box<str>`,
+/// the `TermEntry`, and the `BTreeMap` node share.
+const TERM_OVERHEAD: usize = 48;
+
+/// Per-posting overhead beyond the [`DocPosting`] itself, covering the heap
+/// its positions vector allocates.
+const POSTING_OVERHEAD: usize = 16;
+
 #[derive(Debug, Default)]
 pub struct InvertedIndex {
     terms: BTreeMap<Box<str>, TermEntry>,
     stats: Vec<FieldStats>,
     total_postings: usize,
+    /// Running total for [`InvertedIndex::heap_bytes`], so asking how large the
+    /// index has grown does not walk the whole dictionary. That question is
+    /// asked to decide when to flush, which must not itself cost O(terms).
+    term_bytes: usize,
 }
 
 impl InvertedIndex {
@@ -104,6 +116,7 @@ impl InvertedIndex {
             terms: BTreeMap::new(),
             stats: vec![FieldStats::default(); num_fields],
             total_postings: 0,
+            term_bytes: 0,
         }
     }
 
@@ -132,7 +145,10 @@ impl InvertedIndex {
         for (term, positions) in by_term {
             let entry = match self.terms.get_mut(term) {
                 Some(entry) => entry,
-                None => self.terms.entry(Box::from(term)).or_default(),
+                None => {
+                    self.term_bytes += term.len() + std::mem::size_of::<Box<str>>() + TERM_OVERHEAD;
+                    self.terms.entry(Box::from(term)).or_default()
+                }
             };
             let postings = entry.get_or_insert(field);
             debug_assert!(
@@ -200,12 +216,13 @@ impl InvertedIndex {
     }
 
     /// Rough heap footprint, for flush decisions and `/metrics`.
+    ///
+    /// Both halves are running totals, so this is O(1): postings dominate and
+    /// are approximated as their positions plus overhead rather than by walking
+    /// every vector, and the dictionary total is accumulated as terms are added.
     pub fn heap_bytes(&self) -> usize {
-        // Postings dominate; approximate each as its positions plus overhead
-        // rather than walking every vector.
-        let term_bytes: usize =
-            self.terms.keys().map(|k| k.len() + std::mem::size_of::<Box<str>>() + 48).sum();
-        term_bytes + self.total_postings * (std::mem::size_of::<DocPosting>() + 16)
+        self.term_bytes
+            + self.total_postings * (std::mem::size_of::<DocPosting>() + POSTING_OVERHEAD)
     }
 }
 

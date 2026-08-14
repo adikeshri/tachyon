@@ -91,6 +91,9 @@ pub struct Wal {
     last_sync: Instant,
     /// Bytes appended since the last successful fsync.
     unsynced: u64,
+    /// Set when a failed append left bytes on disk that could not be removed.
+    /// See [`Wal::append_batch`].
+    poisoned: bool,
 }
 
 impl Wal {
@@ -118,7 +121,7 @@ impl Wal {
         }
 
         file.seek(SeekFrom::End(0))?;
-        Ok(Wal { file, path, len, policy, last_sync: Instant::now(), unsynced: 0 })
+        Ok(Wal { file, path, len, policy, last_sync: Instant::now(), unsynced: 0, poisoned: false })
     }
 
     pub fn path(&self) -> &Path {
@@ -141,9 +144,30 @@ impl Wal {
     ///
     /// Generic over the record type so the write path can pass
     /// [`WalRecordRef`] and avoid cloning document bodies.
+    ///
+    /// # Failure
+    ///
+    /// A failed write is rolled back to the last known-good length before the
+    /// error is returned, so the caller's "nothing was applied" assumption
+    /// holds. That rollback matters more than it looks: `write_all` can fail
+    /// having already put some bytes on the platter, and appending the *next*
+    /// batch after that stub would bury it mid-file. Replay stops at the first
+    /// torn frame, so every record after the stub — all of them acknowledged —
+    /// would be silently discarded at recovery.
+    ///
+    /// If the rollback itself fails there is no safe way to continue appending,
+    /// and the handle refuses all further writes rather than build that
+    /// silently-truncating log. Records already written stay readable.
     pub fn append_batch<T: Serialize>(&mut self, records: &[T]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
+        }
+        if self.poisoned {
+            return Err(Error::corruption(format!(
+                "{}: refusing to append after a write failure that could not be rolled back; \
+                 reopen the collection to recover",
+                self.path.display()
+            )));
         }
 
         let mut buf = Vec::with_capacity(records.len() * 256);
@@ -161,11 +185,45 @@ impl Wal {
             buf.extend_from_slice(&payload);
         }
 
-        self.file.write_all(&buf)?;
+        if let Err(cause) = self.file.write_all(&buf) {
+            return Err(self.discard_partial_write(cause));
+        }
         self.len += buf.len() as u64;
         self.unsynced += buf.len() as u64;
         self.maybe_sync()?;
         Ok(())
+    }
+
+    /// Cut the file back to the last byte that belonged to a complete append,
+    /// poisoning the handle if that cannot be done.
+    fn discard_partial_write(&mut self, cause: std::io::Error) -> Error {
+        let rollback =
+            self.file.set_len(self.len).and_then(|()| self.file.seek(SeekFrom::Start(self.len)));
+
+        match rollback {
+            Ok(_) => {
+                tracing::warn!(
+                    wal = %self.path.display(),
+                    length = self.len,
+                    "append failed; rolled the log back to its last complete record"
+                );
+                Error::from(cause)
+            }
+            Err(rollback) => {
+                self.poisoned = true;
+                tracing::error!(
+                    wal = %self.path.display(),
+                    %cause,
+                    %rollback,
+                    "append failed and could not be rolled back; refusing further writes"
+                );
+                Error::corruption(format!(
+                    "{}: append failed ({cause}) and the partial record could not be removed \
+                     ({rollback})",
+                    self.path.display()
+                ))
+            }
+        }
     }
 
     fn maybe_sync(&mut self) -> Result<()> {
@@ -469,6 +527,58 @@ mod tests {
         wal.append(&upsert(1, "a")).unwrap();
         assert!(wal.size() > HEADER_LEN);
         assert_eq!(wal.size(), std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn a_failed_append_is_rolled_back_to_the_last_good_record() {
+        // `write_all` can fail having already put bytes on disk. Were that
+        // stub left in place, the next append would sit behind it and replay —
+        // which stops at the first torn frame — would silently drop every
+        // acknowledged record that followed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.wal");
+
+        let mut wal = Wal::open(&path, SyncPolicy::Always).unwrap();
+        wal.append(&upsert(1, "a")).unwrap();
+        let good_len = wal.size();
+
+        // Leave the file exactly as a half-finished write would.
+        wal.file.write_all(&[7u8, 0, 0, 0, 1, 2, 3]).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > good_len);
+
+        let err = wal.discard_partial_write(std::io::Error::from(std::io::ErrorKind::Other));
+        assert!(!wal.poisoned, "a rollback that succeeded must not poison the handle");
+        assert_eq!(wal.size(), good_len);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len, "the stub is gone");
+        let _ = err;
+
+        // Writes continue, and the record lands where replay will find it.
+        wal.append(&upsert(2, "b")).unwrap();
+        drop(wal);
+
+        let scan = read(&path).unwrap();
+        assert!(scan.truncated_at.is_none(), "a rolled-back write leaves no torn frame");
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(scan.records[1].seq(), 2);
+    }
+
+    #[test]
+    fn a_poisoned_log_refuses_further_appends() {
+        // When the rollback itself fails there is no way to append safely, so
+        // the handle must report that rather than build a log whose tail
+        // recovery would throw away.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.wal");
+
+        let mut wal = Wal::open(&path, SyncPolicy::Always).unwrap();
+        wal.append(&upsert(1, "a")).unwrap();
+        wal.poisoned = true;
+
+        assert!(wal.append(&upsert(2, "b")).is_err());
+        drop(wal);
+
+        // And what was acknowledged before is still readable.
+        assert_eq!(read(&path).unwrap().records.len(), 1);
     }
 
     #[test]

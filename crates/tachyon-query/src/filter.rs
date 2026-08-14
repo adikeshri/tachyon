@@ -405,9 +405,9 @@ fn eval_predicate(predicate: &Predicate, source: &dyn IndexSource) -> RoaringBit
         return match &predicate.op {
             PredOp::Eq(FilterValue::Num(k)) => numeric.range(Some(*k), Some(*k)),
             PredOp::Ne(FilterValue::Num(k)) => numeric.not_equal(*k),
-            PredOp::Lt(k) => numeric.range(None, Some(*k)) - numeric.range(Some(*k), Some(*k)),
+            PredOp::Lt(k) => numeric.less_than(*k),
             PredOp::Le(k) => numeric.range(None, Some(*k)),
-            PredOp::Gt(k) => numeric.range(Some(*k), None) - numeric.range(Some(*k), Some(*k)),
+            PredOp::Gt(k) => numeric.greater_than(*k),
             PredOp::Ge(k) => numeric.range(Some(*k), None),
             PredOp::Range(lo, hi) => numeric.range(Some(*lo), Some(*hi)),
             PredOp::In(values) => {

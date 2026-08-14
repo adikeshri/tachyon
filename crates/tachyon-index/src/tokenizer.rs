@@ -46,6 +46,20 @@ fn is_standalone_ideograph(c: char) -> bool {
 /// Returns `None` if nothing survives normalization (for example a run of
 /// bare combining marks).
 pub fn normalize(run: &str) -> Option<String> {
+    // ASCII is its own NFD, carries no combining marks, and lowercases one
+    // byte to one byte, so the general path's decomposition and per-character
+    // case-mapping iterators can be skipped entirely. This is the overwhelming
+    // majority of tokens in practice and the difference is visible in indexing
+    // throughput; `query_time_and_index_time_normalization_agree` pins the two
+    // paths to the same answer.
+    if run.is_ascii() {
+        if run.is_empty() {
+            return None;
+        }
+        let truncated = &run[..run.len().min(MAX_TOKEN_LEN)];
+        return Some(truncated.to_ascii_lowercase());
+    }
+
     let mut out = String::with_capacity(run.len());
     let mut chars = 0usize;
     for c in run.nfd().filter(|c| !is_combining_mark(*c)) {
@@ -69,6 +83,9 @@ pub fn tokenize(text: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut run = String::new();
     let mut position = 0u32;
+    // Scratch for encoding one ideograph, so splitting CJK text does not
+    // allocate a throwaway `String` per character.
+    let mut char_buf = [0u8; 4];
 
     let flush = |run: &mut String, position: &mut u32, tokens: &mut Vec<Token>| {
         if run.is_empty() {
@@ -84,7 +101,7 @@ pub fn tokenize(text: &str) -> Vec<Token> {
     for c in text.chars() {
         if is_standalone_ideograph(c) {
             flush(&mut run, &mut position, &mut tokens);
-            if let Some(text) = normalize(&c.to_string()) {
+            if let Some(text) = normalize(c.encode_utf8(&mut char_buf)) {
                 tokens.push(Token { text, position });
                 position += 1;
             }
@@ -176,5 +193,25 @@ mod tests {
         for text in ["Café", "WIRELESS", "Ünïcôde", "Mixed123"] {
             assert_eq!(normalize(text).as_deref(), tok(text).first().map(String::as_str));
         }
+    }
+
+    #[test]
+    fn the_ascii_fast_path_matches_the_general_one() {
+        // `normalize` short-circuits for ASCII. Anything it returns there must
+        // be what the decompose-and-fold path would have produced, including
+        // at the truncation boundary and for input that normalizes to nothing.
+        let long = "A".repeat(MAX_TOKEN_LEN + 10);
+        for text in ["Wireless", "USB3", "x", "MiXeD-cAsE", "0123456789", &long] {
+            let ascii = normalize(text).expect("non-empty ASCII always normalizes");
+            let general: String = text
+                .nfd()
+                .filter(|c| !is_combining_mark(*c))
+                .flat_map(char::to_lowercase)
+                .take(MAX_TOKEN_LEN)
+                .collect();
+            assert_eq!(ascii, general, "fast and general paths disagree on {text:?}");
+            assert!(ascii.chars().count() <= MAX_TOKEN_LEN);
+        }
+        assert_eq!(normalize(""), None);
     }
 }

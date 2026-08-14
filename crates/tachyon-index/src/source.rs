@@ -71,9 +71,15 @@ pub trait IndexSource: Send + Sync {
     /// tombstones are applied separately by the executor.
     fn is_live(&self, doc_id: DocId) -> bool;
 
-    /// Append every term starting with `prefix` (PRD §7.3 prefix matching,
-    /// §7.5 autocomplete).
-    fn collect_terms_with_prefix(&self, prefix: &str, out: &mut Vec<String>);
+    /// Append up to `limit` terms starting with `prefix`, in sorted order (PRD
+    /// §7.3 prefix matching, §7.5 autocomplete).
+    ///
+    /// The cap is the callee's job rather than the caller's: truncating an
+    /// already-materialized list still pays to walk and copy every term a
+    /// one-character prefix matches, which on a large dictionary is most of it.
+    /// Because terms come back sorted, taking the first `limit` from each
+    /// source and merging yields the same set as capping the merged result.
+    fn collect_terms_with_prefix(&self, prefix: &str, limit: usize, out: &mut Vec<String>);
 
     /// Append every term within the matcher's edit budget, with its distance.
     ///
@@ -124,8 +130,8 @@ impl IndexSource for MemTable {
         MemTable::is_live(self, doc_id)
     }
 
-    fn collect_terms_with_prefix(&self, prefix: &str, out: &mut Vec<String>) {
-        out.extend(self.index().terms_with_prefix(prefix).map(str::to_owned));
+    fn collect_terms_with_prefix(&self, prefix: &str, limit: usize, out: &mut Vec<String>) {
+        out.extend(self.index().terms_with_prefix(prefix).take(limit).map(str::to_owned));
     }
 
     fn collect_fuzzy_terms(&self, matcher: &mut FuzzyMatcher, out: &mut Vec<(String, u32)>) {

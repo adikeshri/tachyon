@@ -17,13 +17,28 @@
 //! 1. Length differs by more than the budget — impossible, no allocation.
 //! 2. Row minimum exceeds the budget — abandon mid-matrix.
 //!
-//! Most dictionary terms die at step 1.
+//! Most dictionary terms die at step 1. What survives runs the matrix, and
+//! that inner loop is the hottest code in a typo-tolerant search, so two
+//! things it would otherwise repeat per cell are hoisted out of it:
+//!
+//! - The transposition rule needs "the last row at which this candidate
+//!   character occurred in the query". Keying that by `char` costs a hash per
+//!   *cell*; instead every character is mapped once — query characters at
+//!   construction, candidate characters once per candidate — to a dense index
+//!   into the query's distinct characters, and the table becomes a plain array.
+//! - The scratch matrix is grown but never re-zeroed, because every cell the
+//!   matrix reads is written earlier in the same call.
 
 use std::collections::HashMap;
 
 /// Longest token we will run the matrix against. Beyond this the quadratic
 /// cost stops being worth it, and a token this long is not a typo anyway.
 pub const MAX_FUZZY_LEN: usize = 64;
+
+/// Marker in the character-index tables for "not a character of the query".
+/// Such a character has no last-occurrence row, so the transposition rule
+/// reads the sentinel row 0 for it, exactly as a missing map entry did.
+const NOT_IN_QUERY: usize = usize::MAX;
 
 /// Matches one query token against many candidate terms.
 ///
@@ -35,18 +50,40 @@ pub struct FuzzyMatcher {
     max: u32,
     /// Row-major `(query_len + 2) x (candidate_len + 2)` scratch matrix.
     matrix: Vec<u32>,
-    /// Last row at which each character of the query was seen.
-    last_row: HashMap<char, usize>,
+    /// Distinct characters of the query, to a dense index. Built once; used to
+    /// key the last-occurrence table without hashing inside the matrix loop.
+    alphabet: HashMap<char, usize>,
+    /// `query[i]`'s index into `alphabet`, so advancing a row is an array write.
+    query_keys: Vec<usize>,
+    /// `candidate[j]`'s index into `alphabet`, or [`NOT_IN_QUERY`]. Rebuilt once
+    /// per candidate rather than looked up once per cell.
+    candidate_keys: Vec<usize>,
+    /// Last row at which each distinct query character was seen, indexed by
+    /// `alphabet`. Reset per candidate.
+    last_row: Vec<usize>,
     candidate: Vec<char>,
 }
 
 impl FuzzyMatcher {
     pub fn new(query: &str, max: u32) -> FuzzyMatcher {
+        let query: Vec<char> = query.chars().take(MAX_FUZZY_LEN).collect();
+
+        let mut alphabet = HashMap::with_capacity(query.len());
+        let mut query_keys = Vec::with_capacity(query.len());
+        for &c in &query {
+            let next = alphabet.len();
+            query_keys.push(*alphabet.entry(c).or_insert(next));
+        }
+        let last_row = vec![0usize; alphabet.len()];
+
         FuzzyMatcher {
-            query: query.chars().take(MAX_FUZZY_LEN).collect(),
+            query,
             max,
             matrix: Vec::new(),
-            last_row: HashMap::new(),
+            alphabet,
+            query_keys,
+            candidate_keys: Vec::new(),
+            last_row,
             candidate: Vec::new(),
         }
     }
@@ -78,13 +115,29 @@ impl FuzzyMatcher {
         self.candidate.clear();
         self.candidate.extend(candidate.chars());
 
+        // One hash lookup per candidate character, not per matrix cell.
+        self.candidate_keys.clear();
+        for idx in 0..self.candidate.len() {
+            let key = self.alphabet.get(&self.candidate[idx]).copied().unwrap_or(NOT_IN_QUERY);
+            self.candidate_keys.push(key);
+        }
+
         let (m, n) = (self.query.len(), self.candidate.len());
         let width = n + 2;
         let infinity = (m + n) as u32;
 
-        self.matrix.clear();
-        self.matrix.resize(width * (m + 2), 0);
-        self.last_row.clear();
+        // Grown, never cleared: every cell read below is written earlier in
+        // this same call — the sentinel row and column and the first real row
+        // and column are seeded immediately after this, and cell `(i+1, j+1)`
+        // only reads cells at a smaller row or column, which the loop has
+        // already filled. Stale bytes from a previous candidate (whose `width`
+        // may differ) are therefore never observed, and skipping the memset
+        // saves a pass over the whole matrix per candidate.
+        let cells = width * (m + 2);
+        if self.matrix.len() < cells {
+            self.matrix.resize(cells, 0);
+        }
+        self.last_row.fill(0);
 
         // Rows and columns are offset by one so index 0 can hold the sentinel
         // row/column the transposition rule reaches back into.
@@ -108,9 +161,12 @@ impl FuzzyMatcher {
                 // Row of the last occurrence in the query of this candidate
                 // character, and column of the last match in this row: together
                 // they locate the transposition to undo.
+                let candidate_key = self.candidate_keys[j - 1];
                 let last_matching_row =
-                    self.last_row.get(&self.candidate[j - 1]).copied().unwrap_or(0);
-                let cost = if self.query[i - 1] == self.candidate[j - 1] { 0 } else { 1 };
+                    if candidate_key == NOT_IN_QUERY { 0 } else { self.last_row[candidate_key] };
+                // Characters are equal exactly when they share an alphabet slot,
+                // which is already known and cheaper than comparing `char`s.
+                let cost = u32::from(candidate_key != self.query_keys[i - 1]);
 
                 let substitute = self.matrix[at(i, j)] + cost;
                 let insert = self.matrix[at(i + 1, j)] + 1;
@@ -129,7 +185,7 @@ impl FuzzyMatcher {
                 }
             }
 
-            self.last_row.insert(self.query[i - 1], i);
+            self.last_row[self.query_keys[i - 1]] = i;
 
             // Every later row is at least this good, so once the whole row is
             // over budget the answer can only be worse. An empty candidate has
@@ -233,6 +289,50 @@ mod tests {
         assert_eq!(matcher.distance("mousy"), Some(1));
         assert_eq!(matcher.query_len(), 5);
         assert_eq!(matcher.max_distance(), 2);
+    }
+
+    #[test]
+    fn a_reused_matcher_agrees_with_a_fresh_one() {
+        // The scratch matrix is grown but never re-zeroed, and the row width
+        // changes with the candidate length, so a shorter candidate after a
+        // longer one reads cells a previous call wrote. Every answer must
+        // still match a matcher that has seen nothing else — including after
+        // an early abort, which leaves the matrix half-filled.
+        let candidates = [
+            "wireless",
+            "wirelessly",
+            "wire",
+            "w",
+            "",
+            "keyboard",
+            "wireles",
+            "wireiess",
+            "wirelesss",
+            "a",
+            "wieless",
+            "zzzzzzzzzzzz",
+            "wirelss",
+        ];
+        for max in 0..=3 {
+            let mut reused = FuzzyMatcher::new("wireless", max);
+            for candidate in candidates {
+                assert_eq!(
+                    reused.distance(candidate),
+                    FuzzyMatcher::new("wireless", max).distance(candidate),
+                    "`{candidate}` at budget {max} differs once the matcher is warm"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_characters_do_not_confuse_the_transposition_table() {
+        // The last-occurrence table is keyed by distinct query character, so a
+        // query repeating one is the case that catches an indexing mistake.
+        assert_eq!(d("aaa", "aaa"), Some(0));
+        assert_eq!(d("banana", "bananna"), Some(1));
+        assert_eq!(d("aabb", "abab"), Some(1), "one transposition");
+        assert_eq!(d("mississippi", "misisippi"), Some(2));
     }
 
     #[test]

@@ -14,7 +14,9 @@ pub struct EngineConfig {
     pub sync_policy: SyncPolicy,
     /// Flush the memtable into a segment once it holds this many documents.
     pub max_memtable_docs: usize,
-    /// …or once its documents occupy roughly this many bytes, whichever first.
+    /// …or once it occupies roughly this many bytes, whichever comes first.
+    /// Counts the stored documents, the inverted index, and the columns — the
+    /// index alone is usually the larger half.
     pub max_memtable_bytes: usize,
 }
 
