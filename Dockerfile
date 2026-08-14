@@ -93,11 +93,9 @@ FROM alpine:3.21
 
 # ca-certificates: HTTPS/TLS support
 # tini: proper PID 1 / signal forwarding / zombie reaping
-# wget: HTTP health check
 RUN apk add --no-cache \
     ca-certificates \
     tini \
-    wget \
  && addgroup -S tachyon \
  && adduser -S -G tachyon -h /data tachyon
 
@@ -127,4 +125,4 @@ HEALTHCHECK \
     --timeout=3s \
     --start-period=5s \
     --retries=3 \
-    CMD wget -q -O- http://127.0.0.1:8108/health || exit 1
+    CMD ["/usr/local/bin/tachyon", "--healthcheck"]

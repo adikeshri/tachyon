@@ -46,11 +46,20 @@ struct Args {
     /// Log filter, in `tracing-subscriber` EnvFilter syntax.
     #[arg(long, env = "TACHYON_LOG", default_value = "info")]
     log: String,
+
+    /// Check that a locally running Tachyon is healthy, then exit.
+    /// Used as the Docker HEALTHCHECK so the image doesn't need wget/curl.
+    #[arg(long)]
+    healthcheck: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    if args.healthcheck {
+        return healthcheck(args.listen).await;
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&args.log))
@@ -102,6 +111,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("shutting down; flushing write-ahead logs");
     engine.sync_all()?;
     Ok(())
+}
+
+/// Raw HTTP/1.1 GET of `/health`, checking for a `200` status. Deliberately
+/// avoids pulling in an HTTP client crate or an external tool like wget/curl
+/// just to poll ourselves.
+async fn healthcheck(listen: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // `listen` is often 0.0.0.0; dial the loopback address instead of the
+    // unspecified one.
+    let target = if listen.ip().is_unspecified() {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), listen.port())
+    } else {
+        listen
+    };
+
+    let mut stream = tokio::net::TcpStream::connect(target).await?;
+    stream
+        .write_all(
+            format!("GET /health HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+
+    let status_line = response
+        .split(|&b| b == b'\n')
+        .next()
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .unwrap_or_default();
+
+    if status_line.starts_with("HTTP/1.1 200") || status_line.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(format!("unhealthy: {}", status_line.trim()).into())
+    }
 }
 
 async fn shutdown_signal() {
