@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Tachyon logo" width="200">
+</p>
+
 # Tachyon
 
 **Open-source, typo-tolerant full-text search in a single binary.**
