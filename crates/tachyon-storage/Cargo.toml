@@ -1,0 +1,19 @@
+[package]
+name = "tachyon-storage"
+description = "Durable storage for Tachyon: write-ahead log, on-disk layout, collection metadata."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tachyon-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crc32fast.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

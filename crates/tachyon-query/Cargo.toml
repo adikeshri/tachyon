@@ -1,0 +1,21 @@
+[package]
+name = "tachyon-query"
+description = "Query engine for Tachyon: parsing, planning, scoring, ranking."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tachyon-core.workspace = true
+tachyon-index.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+roaring.workspace = true
+tracing.workspace = true
+utoipa = "5.5.0"
+
+[dev-dependencies]
+tempfile.workspace = true

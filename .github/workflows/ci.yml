@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug symbols are only useful when something crashes here, and they are the
+  # bulk of the cache.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+  # The oldest toolchain the crates claim to support, so the claim stays true.
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t tachyon:ci .
+
+      - name: Check the image stays under 50MB
+        run: |
+          bytes=$(docker image inspect tachyon:ci --format '{{.Size}}')
+          mb=$((bytes / 1000000))
+          echo "image is ${mb}MB"
+          if [ "$mb" -gt 50 ]; then
+            echo "::error::image is ${mb}MB, over the 50MB budget"
+            exit 1
+          fi
+
+      - name: Smoke test the quickstart
+        run: |
+          docker run -d --name tachyon -p 8108:8108 tachyon:ci
+          for _ in $(seq 1 60); do
+            curl -sf localhost:8108/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf localhost:8108/health
+
+          curl -sf -X POST localhost:8108/collections \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"products","fields":[{"name":"title","type":"text"}]}'
+
+          curl -sf -X POST localhost:8108/collections/products/documents \
+            -H 'Content-Type: application/json' \
+            -d '[{"id":"1","title":"Wireless Mouse"}]'
+
+          # The typo is the point: this must still find the mouse.
+          found=$(curl -sf 'localhost:8108/collections/products/search?q=wirelss' \
+                  | grep -o '"found":[0-9]*' | cut -d: -f2)
+          test "$found" = "1" || { echo "expected 1 hit, got $found"; exit 1; }
+
+      - name: Server logs
+        if: always()
+        run: docker logs tachyon || true
+
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Not a pass/fail gate — shared CI runners are too noisy for that. This
+      # exists so a pull request that changes performance shows it in the log.
+      - name: Run benchmark
+        run: cargo run --release -p tachyon-bench -- --documents 100000 --queries 1000

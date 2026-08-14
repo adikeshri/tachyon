@@ -1,0 +1,35 @@
+[package]
+name = "tachyon-server"
+description = "REST API and binary for Tachyon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tachyon"
+path = "src/main.rs"
+
+[dependencies]
+tachyon-core.workspace = true
+tachyon-engine.workspace = true
+tachyon-storage.workspace = true
+tachyon-query.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tower-http = { version = "0.6", features = ["trace"] }
+clap = { version = "4", features = ["derive", "env"] }
+parking_lot.workspace = true
+utoipa = { version = "5.5.0", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

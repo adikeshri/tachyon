@@ -1,0 +1,23 @@
+[package]
+name = "tachyon-bench"
+description = "Benchmark harness for Tachyon: indexing throughput and search latency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "tachyon-bench"
+path = "src/main.rs"
+
+[dependencies]
+tachyon-core.workspace = true
+tachyon-engine.workspace = true
+tachyon-query.workspace = true
+tachyon-storage.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+tempfile.workspace = true

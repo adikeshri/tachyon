@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/tachyon-search/tachyon"
+homepage = "https://github.com/tachyon-search/tachyon"
+authors = ["The Tachyon Authors"]
+
+[workspace.dependencies]
+tachyon-core = { path = "crates/tachyon-core", version = "0.1.0" }
+tachyon-storage = { path = "crates/tachyon-storage", version = "0.1.0" }
+tachyon-index = { path = "crates/tachyon-index", version = "0.1.0" }
+tachyon-query = { path = "crates/tachyon-query", version = "0.1.0" }
+tachyon-engine = { path = "crates/tachyon-engine", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crc32fast = "1"
+roaring = "0.11"
+fst = "0.4"
+parking_lot = "0.12"
+memmap2 = "0.9"
+unicode-normalization = "0.1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,20 @@
+[package]
+name = "tachyon-index"
+description = "Index structures for Tachyon: tokenizer, inverted index, columns, memtable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tachyon-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+roaring.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

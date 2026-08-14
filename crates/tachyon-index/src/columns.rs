@@ -1,0 +1,561 @@
+//! Columnar stores backing filters, sorting, and facets (PRD §11: "Numeric
+//! Index: sorted `(value, doc_id)` arrays").
+//!
+//! # Numeric columns
+//!
+//! A range filter wants a sorted array so it can binary-search both ends and
+//! take the slice between. But the memtable is written to constantly, and
+//! re-sorting on every insert would be quadratic. So a numeric column is kept
+//! as a large sorted region plus a small unsorted tail:
+//!
+//! ```text
+//! sorted:  [(9, d3), (12, d1), (40, d7), …]      binary-searched
+//! pending: [(31, d9), (11, d4)]                  linearly scanned, bounded
+//! ```
+//!
+//! Inserts push onto `pending`; once it reaches [`MERGE_THRESHOLD`] the tail is
+//! sorted and merged into the sorted region in one linear pass. Queries read
+//! both. That gives O(log n) range lookups with O(1) amortized inserts, and the
+//! bounded tail means the linear part never dominates.
+//!
+//! # Keyword columns
+//!
+//! Equality and faceting want the opposite shape: value → the set of documents
+//! holding it. A roaring bitmap per distinct value answers both a filter
+//! (return the bitmap) and a facet count (its cardinality) directly.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+use roaring::RoaringBitmap;
+
+use tachyon_core::{DocId, FieldId, Value};
+
+/// Pending entries tolerated before a merge into the sorted region.
+pub const MERGE_THRESHOLD: usize = 4096;
+
+/// A numeric key that keeps integers exact.
+///
+/// Storing everything as `f64` would silently round `int` values beyond 2^53,
+/// which for a database is the kind of bug that surfaces years later in
+/// someone's id column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumKey {
+    Int(i64),
+    Float(f64),
+}
+
+impl NumKey {
+    pub fn as_f64(self) -> f64 {
+        match self {
+            NumKey::Int(i) => i as f64,
+            NumKey::Float(f) => f,
+        }
+    }
+
+    /// Total ordering. Same-variant comparisons are exact; mixed variants fall
+    /// back to `f64`, and NaN sorts last so the order stays total.
+    pub fn cmp_key(&self, other: &NumKey) -> Ordering {
+        match (self, other) {
+            (NumKey::Int(a), NumKey::Int(b)) => a.cmp(b),
+            (a, b) => a.as_f64().total_cmp(&b.as_f64()),
+        }
+    }
+
+    /// Extract a numeric key from a schema value, if it has one.
+    pub fn from_value(value: &Value) -> Option<NumKey> {
+        match value {
+            Value::Int(i) => Some(NumKey::Int(*i)),
+            Value::Float(f) => Some(NumKey::Float(*f)),
+            Value::Bool(b) => Some(NumKey::Int(*b as i64)),
+            _ => None,
+        }
+    }
+}
+
+/// Sorted `(value, doc_id)` pairs for one numeric field.
+#[derive(Debug, Default)]
+pub struct NumericColumn {
+    sorted: Vec<(NumKey, DocId)>,
+    pending: Vec<(NumKey, DocId)>,
+}
+
+impl NumericColumn {
+    /// Record a value. Multi-valued fields insert one entry per value, so a
+    /// range filter matches a document if *any* of its values falls inside.
+    pub fn push(&mut self, key: NumKey, doc_id: DocId) {
+        self.pending.push((key, doc_id));
+        if self.pending.len() >= MERGE_THRESHOLD {
+            self.merge();
+        }
+    }
+
+    /// Fold the pending tail into the sorted region.
+    fn merge(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.pending.sort_by(|a, b| a.0.cmp_key(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut merged = Vec::with_capacity(self.sorted.len() + self.pending.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < self.sorted.len() && j < self.pending.len() {
+            let order = self.sorted[i]
+                .0
+                .cmp_key(&self.pending[j].0)
+                .then(self.sorted[i].1.cmp(&self.pending[j].1));
+            if order.is_le() {
+                merged.push(self.sorted[i]);
+                i += 1;
+            } else {
+                merged.push(self.pending[j]);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&self.sorted[i..]);
+        merged.extend_from_slice(&self.pending[j..]);
+
+        self.sorted = merged;
+        self.pending.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.sorted.len() + self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Documents whose value satisfies `predicate`, where `predicate` must be
+    /// monotonic in the value — every range comparison is.
+    fn select(&self, mut predicate: impl FnMut(NumKey) -> bool, out: &mut RoaringBitmap) {
+        for (key, doc_id) in self.sorted.iter().chain(self.pending.iter()) {
+            if predicate(*key) {
+                out.insert(*doc_id);
+            }
+        }
+    }
+
+    /// Documents with a value in `[lo, hi]`, either bound optional.
+    ///
+    /// The sorted region is bounded by binary search so only the matching
+    /// slice is touched; the pending tail is short enough to scan.
+    pub fn range(&self, lo: Option<NumKey>, hi: Option<NumKey>) -> RoaringBitmap {
+        let mut out = RoaringBitmap::new();
+
+        let start = match lo {
+            Some(lo) => self.sorted.partition_point(|(k, _)| k.cmp_key(&lo).is_lt()),
+            None => 0,
+        };
+        let end = match hi {
+            Some(hi) => self.sorted.partition_point(|(k, _)| k.cmp_key(&hi).is_le()),
+            None => self.sorted.len(),
+        };
+        for (_, doc_id) in &self.sorted[start.min(end)..end] {
+            out.insert(*doc_id);
+        }
+
+        for (key, doc_id) in &self.pending {
+            let above = lo.is_none_or(|lo| key.cmp_key(&lo).is_ge());
+            let below = hi.is_none_or(|hi| key.cmp_key(&hi).is_le());
+            if above && below {
+                out.insert(*doc_id);
+            }
+        }
+
+        out
+    }
+
+    /// Documents whose value differs from `key`. Distinct from
+    /// `!range(key, key)`: a document with no value at all is not "not equal",
+    /// it is absent, and the caller decides what that means.
+    pub fn not_equal(&self, key: NumKey) -> RoaringBitmap {
+        let mut out = RoaringBitmap::new();
+        self.select(|k| k.cmp_key(&key) != Ordering::Equal, &mut out);
+        out
+    }
+
+    /// Distinct values with their document counts, restricted to a result set.
+    ///
+    /// The sorted region already groups equal values together, so counting is
+    /// one pass with no intermediate map; the pending tail is folded in
+    /// afterwards.
+    pub fn value_counts_within(&self, docs: &RoaringBitmap) -> Vec<(NumKey, u64)> {
+        let mut counts: Vec<(NumKey, u64)> = Vec::new();
+
+        let push = |key: NumKey, counts: &mut Vec<(NumKey, u64)>| match counts.last_mut() {
+            Some((last, count)) if last.cmp_key(&key).is_eq() => *count += 1,
+            _ => counts.push((key, 1)),
+        };
+
+        for (key, doc_id) in &self.sorted {
+            if docs.contains(*doc_id) {
+                push(*key, &mut counts);
+            }
+        }
+
+        for (key, doc_id) in &self.pending {
+            if !docs.contains(*doc_id) {
+                continue;
+            }
+            match counts.binary_search_by(|(k, _)| k.cmp_key(key)) {
+                Ok(i) => counts[i].1 += 1,
+                Err(i) => counts.insert(i, (*key, 1)),
+            }
+        }
+
+        counts
+    }
+
+    /// Every document with any value in this column.
+    pub fn present(&self) -> RoaringBitmap {
+        let mut out = RoaringBitmap::new();
+        self.select(|_| true, &mut out);
+        out
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.len() * std::mem::size_of::<(NumKey, DocId)>()
+    }
+}
+
+/// Value → documents, for keyword equality and facets.
+#[derive(Debug, Default)]
+pub struct KeywordColumn {
+    by_value: HashMap<Box<str>, RoaringBitmap>,
+    /// Documents with any value, so `!=` can exclude without resurrecting
+    /// documents that simply lack the field.
+    present: RoaringBitmap,
+}
+
+impl KeywordColumn {
+    pub fn push(&mut self, value: &str, doc_id: DocId) {
+        self.by_value.entry(Box::from(value)).or_default().insert(doc_id);
+        self.present.insert(doc_id);
+    }
+
+    pub fn equals(&self, value: &str) -> RoaringBitmap {
+        self.by_value.get(value).cloned().unwrap_or_default()
+    }
+
+    pub fn not_equal(&self, value: &str) -> RoaringBitmap {
+        &self.present - self.equals(value)
+    }
+
+    pub fn present(&self) -> &RoaringBitmap {
+        &self.present
+    }
+
+    /// Distinct values with their document counts, for faceting.
+    pub fn value_counts(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.by_value.iter().map(|(v, docs)| (v.as_ref(), docs.len()))
+    }
+
+    /// Counts restricted to a result set (PRD §7.7: accurate after filters).
+    pub fn value_counts_within(&self, docs: &RoaringBitmap) -> Vec<(&str, u64)> {
+        self.by_value
+            .iter()
+            .filter_map(|(value, bitmap)| {
+                let count = bitmap.intersection_len(docs);
+                (count > 0).then_some((value.as_ref(), count))
+            })
+            .collect()
+    }
+
+    pub fn num_values(&self) -> usize {
+        self.by_value.len()
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.by_value.iter().map(|(v, docs)| v.len() + 32 + docs.serialized_size()).sum()
+    }
+}
+
+/// All columns of one collection, addressed by field id.
+#[derive(Debug)]
+pub struct Columns {
+    numeric: Vec<Option<NumericColumn>>,
+    keyword: Vec<Option<KeywordColumn>>,
+}
+
+impl Columns {
+    /// Allocate columns for every field the schema says needs one.
+    pub fn new(schema: &tachyon_core::CollectionSchema) -> Columns {
+        let mut numeric = Vec::with_capacity(schema.fields.len());
+        let mut keyword = Vec::with_capacity(schema.fields.len());
+
+        for field in &schema.fields {
+            let (n, k) = if !field.needs_column() {
+                (None, None)
+            } else if field.field_type.is_numeric() {
+                (Some(NumericColumn::default()), None)
+            } else {
+                (None, Some(KeywordColumn::default()))
+            };
+            numeric.push(n);
+            keyword.push(k);
+        }
+
+        Columns { numeric, keyword }
+    }
+
+    pub fn numeric(&self, field: FieldId) -> Option<&NumericColumn> {
+        self.numeric.get(field as usize)?.as_ref()
+    }
+
+    pub fn keyword(&self, field: FieldId) -> Option<&KeywordColumn> {
+        self.keyword.get(field as usize)?.as_ref()
+    }
+
+    /// Record one document's value for one field.
+    pub fn push(&mut self, field: FieldId, doc_id: DocId, value: &Value) {
+        if value.is_null() {
+            return;
+        }
+        for scalar in value.iter_scalars() {
+            if let Some(column) = self.numeric.get_mut(field as usize).and_then(Option::as_mut) {
+                if let Some(key) = NumKey::from_value(scalar) {
+                    column.push(key, doc_id);
+                }
+            } else if let Some(column) =
+                self.keyword.get_mut(field as usize).and_then(Option::as_mut)
+            {
+                if let Some(text) = scalar.as_str() {
+                    column.push(text, doc_id);
+                }
+            }
+        }
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        let n: usize = self.numeric.iter().flatten().map(NumericColumn::heap_bytes).sum();
+        let k: usize = self.keyword.iter().flatten().map(KeywordColumn::heap_bytes).sum();
+        n + k
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tachyon_core::{CollectionSchema, FieldSchema, FieldType};
+
+    fn ids(bitmap: &RoaringBitmap) -> Vec<DocId> {
+        bitmap.iter().collect()
+    }
+
+    fn column_of(values: &[(i64, DocId)]) -> NumericColumn {
+        let mut column = NumericColumn::default();
+        for (v, d) in values {
+            column.push(NumKey::Int(*v), *d);
+        }
+        column
+    }
+
+    #[test]
+    fn numeric_ranges_are_inclusive_on_both_ends() {
+        let c = column_of(&[(10, 0), (20, 1), (30, 2), (40, 3)]);
+        assert_eq!(ids(&c.range(Some(NumKey::Int(20)), Some(NumKey::Int(30)))), vec![1, 2]);
+        assert_eq!(ids(&c.range(Some(NumKey::Int(20)), None)), vec![1, 2, 3]);
+        assert_eq!(ids(&c.range(None, Some(NumKey::Int(20)))), vec![0, 1]);
+        assert_eq!(ids(&c.range(None, None)), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn an_empty_range_selects_nothing() {
+        let c = column_of(&[(10, 0), (20, 1)]);
+        assert!(c.range(Some(NumKey::Int(30)), Some(NumKey::Int(40))).is_empty());
+        assert!(c.range(Some(NumKey::Int(30)), Some(NumKey::Int(20))).is_empty());
+    }
+
+    #[test]
+    fn results_are_identical_across_the_merge_boundary() {
+        // The sorted/pending split must be invisible to callers, so build a
+        // column large enough to have merged several times and check that a
+        // range still returns exactly the right documents.
+        let mut c = NumericColumn::default();
+        let total = MERGE_THRESHOLD * 2 + 137;
+        for i in 0..total {
+            // Interleave values so insertion order never matches sort order.
+            let value = ((i * 7919) % total) as i64;
+            c.push(NumKey::Int(value), i as DocId);
+        }
+        assert_eq!(c.len(), total);
+
+        let selected = c.range(Some(NumKey::Int(100)), Some(NumKey::Int(199)));
+        assert_eq!(selected.len(), 100, "one document per value in the range");
+
+        let expected: Vec<DocId> = (0..total)
+            .filter(|i| {
+                let v = ((i * 7919) % total) as i64;
+                (100..=199).contains(&v)
+            })
+            .map(|i| i as DocId)
+            .collect();
+        assert_eq!(ids(&selected), expected);
+    }
+
+    #[test]
+    fn duplicate_values_all_come_back() {
+        let c = column_of(&[(5, 0), (5, 1), (5, 2), (9, 3)]);
+        assert_eq!(ids(&c.range(Some(NumKey::Int(5)), Some(NumKey::Int(5)))), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn not_equal_excludes_only_that_value() {
+        let c = column_of(&[(10, 0), (20, 1), (10, 2)]);
+        assert_eq!(ids(&c.not_equal(NumKey::Int(10))), vec![1]);
+        assert_eq!(ids(&c.present()), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn integers_stay_exact_beyond_float_precision() {
+        // 2^53 and 2^53 + 1 are the same f64; they must not be the same key.
+        let big = 1i64 << 53;
+        let c = column_of(&[(big, 0), (big + 1, 1)]);
+        assert_eq!(ids(&c.range(Some(NumKey::Int(big)), Some(NumKey::Int(big)))), vec![0]);
+        assert_eq!(ids(&c.not_equal(NumKey::Int(big))), vec![1]);
+    }
+
+    #[test]
+    fn floats_order_correctly_including_negatives() {
+        let mut c = NumericColumn::default();
+        for (v, d) in [(-1.5, 0), (0.0, 1), (2.25, 2), (-10.0, 3)] {
+            c.push(NumKey::Float(v), d);
+        }
+        assert_eq!(ids(&c.range(None, Some(NumKey::Float(0.0)))), vec![0, 1, 3]);
+        assert_eq!(ids(&c.range(Some(NumKey::Float(0.0)), None)), vec![1, 2]);
+    }
+
+    #[test]
+    fn numeric_facet_counts_group_equal_values() {
+        let c = column_of(&[(10, 0), (20, 1), (10, 2), (30, 3), (10, 4)]);
+        let all = RoaringBitmap::from_iter([0u32, 1, 2, 3, 4]);
+        assert_eq!(
+            c.value_counts_within(&all),
+            vec![(NumKey::Int(10), 3), (NumKey::Int(20), 1), (NumKey::Int(30), 1)]
+        );
+
+        let subset = RoaringBitmap::from_iter([0u32, 1]);
+        assert_eq!(
+            c.value_counts_within(&subset),
+            vec![(NumKey::Int(10), 1), (NumKey::Int(20), 1)]
+        );
+
+        assert!(c.value_counts_within(&RoaringBitmap::new()).is_empty());
+    }
+
+    #[test]
+    fn numeric_facet_counts_are_correct_across_the_merge_boundary() {
+        // Values must be grouped whether they sit in the sorted region, the
+        // pending tail, or both.
+        let mut c = NumericColumn::default();
+        let total = MERGE_THRESHOLD + 500;
+        for i in 0..total {
+            c.push(NumKey::Int((i % 5) as i64), i as DocId);
+        }
+        let all: RoaringBitmap = (0..total as u32).collect();
+        let counts = c.value_counts_within(&all);
+
+        assert_eq!(counts.len(), 5, "five distinct values: {counts:?}");
+        assert_eq!(counts.iter().map(|(_, n)| n).sum::<u64>(), total as u64);
+        assert!(
+            counts.windows(2).all(|w| w[0].0.cmp_key(&w[1].0).is_lt()),
+            "counts must come back in value order"
+        );
+    }
+
+    #[test]
+    fn keyword_equality_and_negation() {
+        let mut c = KeywordColumn::default();
+        c.push("Logitech", 0);
+        c.push("Razer", 1);
+        c.push("Logitech", 2);
+
+        assert_eq!(ids(&c.equals("Logitech")), vec![0, 2]);
+        assert!(c.equals("Nobody").is_empty());
+        assert_eq!(ids(&c.not_equal("Logitech")), vec![1]);
+        assert_eq!(c.num_values(), 2);
+    }
+
+    #[test]
+    fn keyword_negation_does_not_invent_documents_without_the_field() {
+        let mut c = KeywordColumn::default();
+        c.push("Logitech", 0);
+        // Document 5 never wrote to this column at all.
+        assert!(!c.not_equal("Logitech").contains(5));
+    }
+
+    #[test]
+    fn facet_counts_respect_a_result_set() {
+        let mut c = KeywordColumn::default();
+        for (brand, doc) in [("Logitech", 0), ("Razer", 1), ("Logitech", 2), ("Anker", 3)] {
+            c.push(brand, doc);
+        }
+
+        let mut all: Vec<_> = c.value_counts().collect();
+        all.sort();
+        assert_eq!(all, vec![("Anker", 1), ("Logitech", 2), ("Razer", 1)]);
+
+        let subset = RoaringBitmap::from_iter([0u32, 1]);
+        let mut within = c.value_counts_within(&subset);
+        within.sort();
+        assert_eq!(within, vec![("Logitech", 1), ("Razer", 1)]);
+    }
+
+    #[test]
+    fn columns_are_allocated_only_where_the_schema_asks() {
+        let schema = CollectionSchema::new(
+            "products",
+            vec![
+                FieldSchema::new("title", FieldType::Text),
+                FieldSchema::new("brand", FieldType::Keyword).with_facet(true),
+                FieldSchema::new("price", FieldType::Int).with_filter(true),
+                FieldSchema::new("notes", FieldType::Keyword),
+            ],
+        );
+        let columns = Columns::new(&schema);
+
+        assert!(columns.keyword(1).is_some(), "faceted keyword gets a column");
+        assert!(columns.numeric(2).is_some(), "filterable int gets a column");
+        assert!(columns.numeric(0).is_none() && columns.keyword(0).is_none());
+        assert!(columns.keyword(3).is_none(), "a plain keyword field needs no column");
+    }
+
+    #[test]
+    fn pushing_routes_values_to_the_right_column() {
+        let schema = CollectionSchema::new(
+            "products",
+            vec![
+                FieldSchema::new("title", FieldType::Text),
+                FieldSchema::new("brand", FieldType::Keyword).with_facet(true),
+                FieldSchema::new("price", FieldType::Int).with_filter(true),
+            ],
+        );
+        let mut columns = Columns::new(&schema);
+        columns.push(1, 0, &Value::Str("Logitech".into()));
+        columns.push(2, 0, &Value::Int(2999));
+        columns.push(2, 1, &Value::Null);
+
+        assert_eq!(ids(&columns.keyword(1).unwrap().equals("Logitech")), vec![0]);
+        assert_eq!(columns.numeric(2).unwrap().len(), 1, "null is not a value");
+    }
+
+    #[test]
+    fn multi_valued_fields_record_every_value() {
+        let schema = CollectionSchema::new(
+            "products",
+            vec![
+                FieldSchema::new("title", FieldType::Text),
+                FieldSchema::new("tags", FieldType::Keyword).with_facet(true),
+            ],
+        );
+        let mut columns = Columns::new(&schema);
+        columns.push(1, 0, &Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())]));
+
+        let tags = columns.keyword(1).unwrap();
+        assert_eq!(ids(&tags.equals("a")), vec![0]);
+        assert_eq!(ids(&tags.equals("b")), vec![0]);
+        assert_eq!(tags.num_values(), 2);
+    }
+}
