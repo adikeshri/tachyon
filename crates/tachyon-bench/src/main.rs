@@ -10,6 +10,8 @@
 
 mod corpus;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -47,6 +49,20 @@ struct Args {
     /// Also benchmark filtered, sorted, and faceted searches.
     #[arg(long, default_value_t = true)]
     full: bool,
+
+    /// Also run a flush-under-load scenario: a low `--max-memtable-docs` so
+    /// segment flushes happen mid-run, with a background thread searching
+    /// continuously, to measure what a flush — which holds the write lock
+    /// for its full duration — costs concurrent readers. Off by default: the
+    /// scenario above stays flush-free on purpose, so its numbers remain a
+    /// stable baseline unaffected by the flush path's own performance.
+    #[arg(long)]
+    flush_scenario: bool,
+
+    /// Memtable document threshold for `--flush-scenario`, chosen well below
+    /// `--documents` so several flushes happen during one run.
+    #[arg(long, default_value_t = 5_000)]
+    flush_scenario_max_memtable_docs: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -154,6 +170,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let suggest = Measurement { latencies: suggest_latencies, total_hits: suggestions as u64 };
     report("Autocomplete", &suggest, 5.0);
+
+    if args.flush_scenario {
+        run_flush_scenario(&args)?;
+    }
+
+    Ok(())
+}
+
+/// Index the corpus into a collection whose memtable threshold is crossed
+/// repeatedly, while a background thread searches the whole time, and report
+/// search latency under that concurrent flush load. A separate collection and
+/// scenario from the one above — the goal here is to see flush's cost, not to
+/// fold it into (and skew) the flush-free baseline.
+fn run_flush_scenario(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Flush-under-load scenario");
+    println!("  documents               {}", args.documents);
+    println!("  max_memtable_docs       {}", args.flush_scenario_max_memtable_docs);
+    println!();
+
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::new(dir.path());
+    layout.initialize()?;
+    let config = EngineConfig::new(dir.path())
+        .with_sync_policy(SyncPolicy::Interval(Duration::from_millis(200)))
+        .with_max_memtable_docs(args.flush_scenario_max_memtable_docs);
+
+    let collection = Arc::new(Collection::create(&layout, corpus::schema("products"), &config)?);
+
+    let mut rng = Rng::new(args.seed ^ 0x5eed);
+    let queries = corpus::queries(&mut rng, args.queries.max(200));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let latencies = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let total_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let search_thread = {
+        let collection = Arc::clone(&collection);
+        let stop = Arc::clone(&stop);
+        let latencies = Arc::clone(&latencies);
+        let total_hits = Arc::clone(&total_hits);
+        let queries = queries.clone();
+        std::thread::spawn(move || {
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let q = &queries[i % queries.len()];
+                let started = Instant::now();
+                if let Ok(response) =
+                    collection.search(SearchParams { q: Some(q.clone()), ..Default::default() })
+                {
+                    total_hits.fetch_add(response.found as u64, Ordering::Relaxed);
+                }
+                latencies
+                    .lock()
+                    .expect("latencies mutex poisoned")
+                    .push(started.elapsed().as_micros() as u64);
+                i += 1;
+            }
+        })
+    };
+
+    let mut rng = Rng::new(args.seed);
+    let started = Instant::now();
+    let mut indexed = 0usize;
+    while indexed < args.documents {
+        let this_batch = args.batch_size.min(args.documents - indexed);
+        let batch: Vec<_> =
+            (0..this_batch).map(|i| corpus::document(&mut rng, indexed + i)).collect();
+        let report = collection.upsert_batch(batch)?;
+        if report.num_failed > 0 {
+            return Err(format!("{} documents failed to index", report.num_failed).into());
+        }
+        indexed += this_batch;
+    }
+    let index_elapsed = started.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    search_thread.join().expect("search thread panicked");
+
+    let stats = collection.stats();
+    println!("Indexing (with flushes)");
+    println!("  elapsed                 {:.2}s", index_elapsed.as_secs_f64());
+    println!(
+        "  throughput              {:.0} docs/sec",
+        args.documents as f64 / index_elapsed.as_secs_f64()
+    );
+    println!("  segments produced       {}", stats.num_segments);
+    println!("  documents               {}", stats.num_documents);
+    println!();
+
+    let latencies =
+        Arc::try_unwrap(latencies).expect("search thread has joined").into_inner().unwrap();
+    let total_hits = total_hits.load(Ordering::Relaxed);
+    let measurement = Measurement { latencies, total_hits };
+    report("Search, concurrent with flushing", &measurement, 60.0);
 
     Ok(())
 }

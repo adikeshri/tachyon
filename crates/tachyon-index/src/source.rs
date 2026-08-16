@@ -3,15 +3,30 @@
 //! A search runs over an ordered list of sources — the memtable plus every
 //! committed segment (PRD §10: "search memtable, search immutable segments,
 //! merge results"). Both sides implement this trait, so the executor never
-//! branches on which one it is holding.
+//! branches on which it is holding.
 //!
 //! Deliberately object-safe: the executor holds `&[&dyn IndexSource]`.
+//!
+//! # Borrowed vs. owned
+//!
+//! Every method that hands back index data returns [`Cow`] rather than a bare
+//! reference. The memtable's data already lives in memory in exactly the
+//! shape callers want, so it returns `Cow::Borrowed` at zero cost — nothing
+//! about the memtable's performance changes. A segment, however, keeps almost
+//! nothing decoded at rest: its postings, columns, and document values are
+//! read from an mmap'd file and decoded into an owned value only when asked
+//! for, which is what keeps a segment's resident memory bounded by corpus
+//! size rather than by how much of it has ever been queried. `Cow` lets one
+//! trait describe both without forcing the memtable to pay a clone it never
+//! needed.
+
+use std::borrow::Cow;
 
 use roaring::RoaringBitmap;
 
 use tachyon_core::{DocId, FieldId, Value};
 
-use crate::columns::Columns;
+use crate::columns::{KeywordColumn, NumericColumn};
 use crate::fuzzy::FuzzyMatcher;
 use crate::inverted::FieldPostings;
 use crate::memtable::MemTable;
@@ -25,18 +40,21 @@ pub trait IndexSource: Send + Sync {
     fn end_doc_id(&self) -> DocId;
 
     /// A document's stored value for a field, used by sorting and the
-    /// popularity signal. O(1): sorting must not scan a column per document.
-    fn value(&self, doc_id: DocId, field: FieldId) -> Option<&Value>;
+    /// popularity signal.
+    fn value(&self, doc_id: DocId, field: FieldId) -> Option<Cow<'_, Value>>;
 
-    /// The filter, sort, and facet columns for this source.
-    fn columns(&self) -> &Columns;
+    /// The numeric filter/sort column for a field, if it has one.
+    fn numeric_column(&self, field: FieldId) -> Option<Cow<'_, NumericColumn>>;
+
+    /// The keyword filter/facet column for a field, if it has one.
+    fn keyword_column(&self, field: FieldId) -> Option<Cow<'_, KeywordColumn>>;
 
     /// Postings for a term in a field, or `None` if absent.
-    fn postings(&self, term: &str, field: FieldId) -> Option<&FieldPostings>;
+    fn postings(&self, term: &str, field: FieldId) -> Option<Cow<'_, FieldPostings>>;
 
     /// Documents in this source containing `term` in `field`.
     fn doc_freq(&self, term: &str, field: FieldId) -> u32 {
-        self.postings(term, field).map_or(0, FieldPostings::doc_freq)
+        self.postings(term, field).map_or(0, |p| p.doc_freq())
     }
 
     /// Documents containing `term` in `field` that are still live.
@@ -98,16 +116,20 @@ impl IndexSource for MemTable {
         self.next_doc_id()
     }
 
-    fn value(&self, doc_id: DocId, field: FieldId) -> Option<&Value> {
-        self.get(doc_id).and_then(|d| d.values.get(field as usize))
+    fn value(&self, doc_id: DocId, field: FieldId) -> Option<Cow<'_, Value>> {
+        self.get(doc_id).and_then(|d| d.values.get(field as usize)).map(Cow::Borrowed)
     }
 
-    fn columns(&self) -> &Columns {
-        MemTable::columns(self)
+    fn numeric_column(&self, field: FieldId) -> Option<Cow<'_, NumericColumn>> {
+        MemTable::columns(self).numeric(field).map(Cow::Borrowed)
     }
 
-    fn postings(&self, term: &str, field: FieldId) -> Option<&FieldPostings> {
-        self.index().postings(term, field)
+    fn keyword_column(&self, field: FieldId) -> Option<Cow<'_, KeywordColumn>> {
+        MemTable::columns(self).keyword(field).map(Cow::Borrowed)
+    }
+
+    fn postings(&self, term: &str, field: FieldId) -> Option<Cow<'_, FieldPostings>> {
+        self.index().postings(term, field).map(Cow::Borrowed)
     }
 
     fn doc_freq(&self, term: &str, field: FieldId) -> u32 {

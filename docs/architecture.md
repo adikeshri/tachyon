@@ -105,6 +105,78 @@ surfaces years later in someone's id column.
 answers an equality filter (return the bitmap) and a facet count (its
 cardinality).
 
+## Segments
+
+A flush turns a memtable into five immutable files — `<id>.terms`, `<id>.ids`,
+`<id>.post`, `<id>.col`, `<id>.doc` — under `segments/`, one file per
+structure rather than one shared blob, so postings, columns, and the document
+store can each use whatever layout suits them without agreeing on a common
+framing. `.terms` and `.ids` are `fst::Map`s (term → dense id, and user id →
+doc id); `.post`, `.col`, and `.doc` each carry a small eager header — an
+offset table, essentially — followed by the data it points into.
+
+Every file is mmap'd, and every read decodes only what it was asked for:
+
+- **`.post`**: the header holds per-field corpus stats and a byte offset per
+  term. A query resolves a term through `.terms`' FST to a dense id, then
+  decodes just that one term's block — nothing else in the file is touched.
+  `doc_freq`/`live_doc_freq` go further still: they only ever need a document
+  count or a liveness check, never positions, so they walk the block skipping
+  position arrays instead of decoding and allocating them — the difference
+  matters because autocomplete calls both across every candidate term and
+  every source.
+- **`.col`**: the header is a small per-field directory (tag, offset,
+  length). A query decodes one field's column — reusing
+  `NumericColumn`/`KeywordColumn` verbatim via `from_sorted`/`from_parts` —
+  never the whole file.
+- **`.doc`**: field lengths and per-field values sit in dense, fixed-width
+  arrays indexed directly by `doc_id`, so BM25's `|d|` and a numeric/bool
+  field's value cost a bounds-checked read at a computed offset — no decode
+  step, no allocation. Text and array values, and the document's source JSON,
+  are variable-length and read on demand through a small offset directory;
+  the source in particular is parsed only when a matched document actually
+  becomes a returned hit, not for every document a query scores.
+
+`IndexSource`'s methods reflect this: `postings`, `numeric_column`,
+`keyword_column`, and `value` all return `Cow<'_, T>` rather than `&T`. The
+memtable returns `Cow::Borrowed` — its data already lives in memory in the
+shape callers want, so nothing about its cost changes. A segment returns
+`Cow::Owned`, built fresh from the mapped bytes on every call. That's the
+whole trade: a segment pays a small decode per query instead of holding
+everything decoded at rest, which is what keeps a segment's resident memory
+bounded by how much of it is queried rather than by its size on disk.
+
+Segments still win on two fronts a memtable can't, independent of laziness:
+the files survive a restart, so replay is bounded to the WAL generation
+opened after the last flush rather than the whole log, and a flush holds
+nothing for a document deleted before it — the memtable's own postings and
+columns are never pruned until then.
+
+A flush also has to tell apart two reasons a doc id can be missing from a
+segment, and conflating them would either resurrect a deleted document or
+silently drop a live one:
+
+- **Never written.** A document deleted from the memtable before ever being
+  flushed leaves nothing behind — no postings, no column entries, no doc
+  record. A segment-local presence bitmap records exactly which ids in its
+  `[min_doc_id, max_doc_id]` range were live at flush time, and
+  `IndexSource::is_live` answers from that alone.
+- **Deleted after commit.** A document deleted, or superseded by an upsert,
+  once it already lives in a segment is tombstoned in the collection-wide
+  `deleted` bitmap — the same one `state.json` persists — which the executor
+  checks separately from `is_live` (see "Reading" below). A segment reader
+  never sees these; it only ever answers "was this id written here."
+
+Flushing runs under the same write-lock acquisition as the mutation that
+triggered it, start to finish. Splitting it into separate acquisitions would
+let a concurrent write's WAL record land at or below the `applied_seq` this
+flush is about to commit — silently excluded from every future replay despite
+never having reached a segment. Segment files are written before `state.json`
+is replaced, so a crash between the two leaves orphaned files at an id nothing
+references; `Collection::open` never scans the `segments/` directory, only the
+ids `state.json` names, so a later flush reusing that id simply overwrites
+them.
+
 ## Reading
 
 A search runs over an ordered list of sources — the memtable, then every
@@ -167,21 +239,28 @@ minimum over budget (abandon mid-matrix). Most terms die on the length check.
 ## Concurrency
 
 Each collection is an `RwLock` over its mutable state. Searches take the read
-lock and run concurrently with each other; a write holds the write lock only
-for the WAL append and the memtable update. This is deliberately simple, and it
-is the obvious place to look when write throughput under concurrent search
-becomes the bottleneck — the next step would be an atomically-swapped read
-snapshot so searches never block at all.
+lock and run concurrently with each other; a write normally holds the write
+lock only for the WAL append and the memtable update, except when it also
+triggers a flush — that runs to completion under the same acquisition (see
+"Segments"), so the occasional write that crosses the memtable threshold
+blocks readers for the length of a segment encode and write rather than a WAL
+append. This is deliberately simple, and it is the obvious place to look when
+write throughput under concurrent search becomes the bottleneck — the next
+step would be an atomically-swapped read snapshot so searches never block at
+all.
 
 ## What is not built yet
 
-**Segment flush.** The memtable is never written to disk, so memory grows with
-the corpus and startup replays the whole log. Everything around it exists: the
-commit protocol, WAL generations, tombstone bitmaps, and the `IndexSource`
-abstraction segments plug into. This is the most important next piece of work.
+**Tiered merges.** Nothing yet bounds how many segments a long-lived
+collection accumulates, or reclaims the space a document occupies across a
+delete-then-merge. This is the more pressing of the two remaining gaps:
+`SearchContext.sources` is a flat `Vec`, so a query fans out across the
+memtable plus every committed segment with nothing merging them back down,
+and each segment pays its own decode independently. Measured search p95 over
+HTTP, default 100k-document flush threshold: ~9ms at 100k docs (1 segment),
+~88ms at 1M (10 segments), ~524ms at 5M (50 segments) — segment count, not
+corpus size alone, is doing most of that. Bounding it is what fixes that.
 
 **Block-max WAND.** The executor scores every match. Early termination would
 let it skip documents that cannot reach the top-K, which is what broad queries
-on large corpora need.
-
-**Tiered merges.** Follows segments.
+on large corpora need — independent of, and complementary to, tiered merges.
