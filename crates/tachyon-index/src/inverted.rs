@@ -206,6 +206,13 @@ impl InvertedIndex {
         self.terms.keys().map(|k| k.as_ref())
     }
 
+    /// Every term, in sorted order, with its postings per field — including
+    /// postings for since-deleted documents. Used by the segment writer,
+    /// which filters those out itself against the memtable's live set.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[(FieldId, FieldPostings)])> {
+        self.terms.iter().map(|(term, entry)| (term.as_ref(), entry.fields.as_slice()))
+    }
+
     /// Terms starting with `prefix`, in sorted order (PRD §7.5, §7.3 prefix
     /// matching). Walks only the matching range, not the whole dictionary.
     pub fn terms_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {

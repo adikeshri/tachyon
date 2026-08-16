@@ -47,13 +47,11 @@ pub fn compute(
         let mut totals: HashMap<String, u64> = HashMap::new();
 
         for source in &ctx.sources {
-            let columns = source.columns();
-
-            if let Some(keyword) = columns.keyword(field) {
+            if let Some(keyword) = source.keyword_column(field) {
                 for (value, count) in keyword.value_counts_within(matched) {
                     *totals.entry(value.to_string()).or_default() += count;
                 }
-            } else if let Some(numeric) = columns.numeric(field) {
+            } else if let Some(numeric) = source.numeric_column(field) {
                 for (key, count) in numeric.value_counts_within(matched) {
                     *totals.entry(format_key(key)).or_default() += count;
                 }

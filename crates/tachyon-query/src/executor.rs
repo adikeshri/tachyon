@@ -28,6 +28,7 @@
 //! `(slot, field, token)`. A newly matched document appends one block; nothing
 //! else allocates.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use roaring::RoaringBitmap;
@@ -116,7 +117,7 @@ impl<'a> SearchContext<'a> {
         FieldStats::new(doc_count, total_len)
     }
 
-    fn value(&self, doc_id: DocId, field: FieldId) -> Option<&Value> {
+    fn value(&self, doc_id: DocId, field: FieldId) -> Option<Cow<'a, Value>> {
         self.sources.iter().find_map(|s| {
             (doc_id >= s.min_doc_id() && doc_id < s.end_doc_id()).then(|| s.value(doc_id, field))?
         })
@@ -302,9 +303,13 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
     let needs_positions = tokens.len() > 1 || !query.phrases.is_empty();
     let mut acc = Accumulator::new(req.query_by.len(), tokens.len(), needs_positions);
 
-    // Reused across candidates so resolving a term against every source does
-    // not allocate per candidate.
-    let mut per_source: Vec<Option<&FieldPostings>> = Vec::with_capacity(ctx.sources.len());
+    // Reused across candidates so the outer `Vec` does not reallocate per
+    // candidate. The `Cow` each slot holds is a zero-cost borrow for a
+    // memtable source but a fresh decode for a segment one — resolving a
+    // term against every source once, rather than once for `doc_freq` and
+    // again for the postings walk, still matters for a segment exactly
+    // because that decode is real work now.
+    let mut per_source: Vec<Option<Cow<'_, FieldPostings>>> = Vec::with_capacity(ctx.sources.len());
 
     for (field_pos, &(field, _boost)) in req.query_by.iter().enumerate() {
         let stats = ctx.field_stats(field);
@@ -321,7 +326,7 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
                 per_source.extend(ctx.sources.iter().map(|s| s.postings(&candidate.term, field)));
 
                 let doc_freq: u32 =
-                    per_source.iter().map(|p| p.map_or(0, FieldPostings::doc_freq)).sum();
+                    per_source.iter().map(|p| p.as_ref().map_or(0, |p| p.doc_freq())).sum();
                 if doc_freq == 0 {
                     continue;
                 }
@@ -450,7 +455,7 @@ fn finish(
 
         let popularity = popularity_field
             .and_then(|f| ctx.value(doc_id, f))
-            .and_then(Value::as_f64)
+            .and_then(|v| v.as_f64())
             .map(|v| score::normalize_popularity(v as f32))
             .unwrap_or(0.0);
 
@@ -544,7 +549,7 @@ fn sort_values(
         .iter()
         .map(|clause| match clause.key {
             SortKey::TextMatch => SortValue::Score(score),
-            SortKey::Field(field) => sort::sort_value(ctx.value(doc_id, field)),
+            SortKey::Field(field) => sort::sort_value(ctx.value(doc_id, field).as_deref()),
         })
         .collect()
 }

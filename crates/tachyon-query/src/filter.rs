@@ -397,11 +397,10 @@ pub fn evaluate(expr: &FilterExpr, sources: &[&dyn IndexSource]) -> RoaringBitma
 }
 
 fn eval_predicate(predicate: &Predicate, source: &dyn IndexSource) -> RoaringBitmap {
-    let columns = source.columns();
     let field = predicate.field;
 
     // A field can have a numeric column or a keyword one, never both.
-    if let Some(numeric) = columns.numeric(field) {
+    if let Some(numeric) = source.numeric_column(field) {
         return match &predicate.op {
             PredOp::Eq(FilterValue::Num(k)) => numeric.range(Some(*k), Some(*k)),
             PredOp::Ne(FilterValue::Num(k)) => numeric.not_equal(*k),
@@ -433,7 +432,7 @@ fn eval_predicate(predicate: &Predicate, source: &dyn IndexSource) -> RoaringBit
         };
     }
 
-    if let Some(keyword) = columns.keyword(field) {
+    if let Some(keyword) = source.keyword_column(field) {
         return match &predicate.op {
             PredOp::Eq(FilterValue::Text(v)) => keyword.equals(v),
             PredOp::Ne(FilterValue::Text(v)) => keyword.not_equal(v),

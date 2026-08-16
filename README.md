@@ -17,7 +17,8 @@ docker run -p 8108:8108 ghcr.io/tachyon-search/tachyon:latest
 > **Status: alpha.** The API is stable enough to build against and every
 > feature below is tested end to end, but this has not run in production
 > anywhere. See [Known limitations](#known-limitations) before you rely on it —
-> in particular, **all data currently lives in memory**.
+> in particular, **queries get slower as a collection accumulates segments**,
+> since nothing merges them yet.
 
 ---
 
@@ -123,20 +124,24 @@ corpus**; see [Known limitations](#known-limitations).
 
 Read this before choosing Tachyon.
 
-**Everything is held in memory.** Writes are durable — they go to a write-ahead
-log and are replayed on startup — but the memtable is never flushed into an
-on-disk segment, so RAM use grows with the corpus and startup replays the whole
-log. At roughly **1.1 KiB per document**, 5M documents needs about 5 GiB, above
-the 2.5 GiB the design targets. The segment writer is the single most important
-next piece of work: the query engine already reads through a source abstraction
-that segments plug into, and the commit protocol (`state.json`, WAL generations,
-tombstone bitmaps) is built and tested around them.
+**Segment count is unbounded.** Writes are durable — they go to a write-ahead
+log and are replayed on startup — and once a memtable crosses
+`--max-memtable-docs`/`--max-memtable-bytes` it is flushed into an immutable,
+mmap'd on-disk segment: postings, columns, and document values are all read
+lazily and decoded only for what a query actually touches, which is what
+keeps memory bounded by how much of the corpus is hot rather than by corpus
+size. What isn't done yet is merging: a query runs over the memtable plus
+every committed segment with nothing folding them back together, so a
+long-lived collection accumulates segments and each one adds its own share of
+per-query overhead. Measured at the default 100k-document flush threshold:
+search p95 was ~9 ms at 100k documents (1 segment), ~88 ms at 1M (10
+segments), ~524 ms at 5M (50 segments). Tiered merges are the next piece of
+work here.
 
-**Broad queries scale linearly.** Every matching document is scored. At 1M
-documents a query matching 6% of the corpus costs ~68 ms at p95. Real catalogues
-are far more selective — and adding a filter already halves it — but the fix is
-block-max WAND early termination, which would let the executor skip documents
-that cannot reach the top-K.
+**Broad queries scale linearly.** Every matching document is scored. Real
+catalogues are far more selective than a broad query — and adding a filter
+already halves the cost — but the fix is block-max WAND early termination,
+which would let the executor skip documents that cannot reach the top-K.
 
 **Not yet built:** distributed clustering, replication, synonyms, stemming, stop
 words, highlighting, geo search, and nested documents. All are explicit
@@ -173,7 +178,7 @@ Needs Rust 1.85 or newer.
 
 ```bash
 cargo build --release        # binary at target/release/tachyon
-cargo test                   # 318 tests
+cargo test                   # 350 tests
 cargo clippy --all-targets
 ```
 
@@ -183,7 +188,7 @@ The workspace is layered so each crate depends only on the ones below it:
 tachyon-server   REST API, auth, analytics, metrics, the binary
 tachyon-engine   collection lifecycle, write path, recovery
 tachyon-query    parsing, planning, scoring, ranking
-tachyon-index    tokenizer, inverted index, columns, fuzzy matching
+tachyon-index    tokenizer, inverted index, columns, fuzzy matching, segments
 tachyon-storage  write-ahead log, on-disk layout, metadata
 tachyon-core     schema, values, documents, errors
 ```

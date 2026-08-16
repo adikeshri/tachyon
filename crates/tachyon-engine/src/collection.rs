@@ -16,6 +16,8 @@
 //! order. Because doc ids are assigned sequentially from `state.next_doc_id`,
 //! replay reconstructs exactly the ids the crashed process had assigned.
 
+use std::sync::Arc;
+
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -23,14 +25,29 @@ use serde_json::Value as Json;
 use utoipa::ToSchema;
 
 use tachyon_core::{CollectionSchema, DocId, Error, ParsedDocument, Result};
-use tachyon_index::MemTable;
+use tachyon_index::{encode, IndexSource, MemTable, SegmentFilePaths, SegmentReader};
 use tachyon_query::{
     compute_facets, execute, suggest, Hit, SearchContext, SearchParams, SearchRequest,
     SearchResponse, SuggestParams, SuggestRequest, SuggestResponse,
 };
-use tachyon_storage::{meta, wal, CollectionState, Layout, Wal, WalRecord, WalRecordRef};
+use tachyon_storage::layout::sync_dir;
+use tachyon_storage::{
+    meta, wal, write_atomic, CollectionState, Layout, SegmentRef, Wal, WalRecord, WalRecordRef,
+};
 
 use crate::config::EngineConfig;
+
+/// Path of every file one segment id is stored as, under this collection's
+/// `segments/` directory.
+fn segment_file_paths(layout: &Layout, name: &str, id: u64) -> SegmentFilePaths {
+    SegmentFilePaths {
+        terms: layout.segment_file(name, id, "terms"),
+        ids: layout.segment_file(name, id, "ids"),
+        post: layout.segment_file(name, id, "post"),
+        col: layout.segment_file(name, id, "col"),
+        doc: layout.segment_file(name, id, "doc"),
+    }
+}
 
 /// Per-document result of a batch write. A batch is not all-or-nothing: PRD
 /// §7.2 requires atomicity *per document*, so one malformed document does not
@@ -84,6 +101,10 @@ struct Inner {
     state: CollectionState,
     wal: Wal,
     memtable: MemTable,
+    /// Committed segments, oldest first. Consulted newest-first (`.rev()`)
+    /// after a memtable miss, since a later segment's version of an id, if
+    /// any, is the current one.
+    segments: Vec<Arc<SegmentReader>>,
     /// Tombstones for doc ids that live in committed segments. Memtable
     /// documents are deleted in place, so they never appear here.
     deleted: RoaringBitmap,
@@ -128,6 +149,14 @@ impl Collection {
             deleted.insert(*id);
         }
 
+        // Segments before replay: a replayed upsert or delete may reference a
+        // document whose only prior version already lives in one of them.
+        let mut segments = Vec::with_capacity(state.segments.len());
+        for seg_ref in &state.segments {
+            let paths = segment_file_paths(layout, name, seg_ref.id);
+            segments.push(Arc::new(SegmentReader::open(&paths, &schema)?));
+        }
+
         let mut memtable = MemTable::new(state.next_doc_id, &schema);
         let mut next_seq = state.next_seq;
 
@@ -153,10 +182,10 @@ impl Collection {
                             wal_path.display()
                         ))
                     })?;
-                    Self::apply_upsert(&mut memtable, parsed);
+                    Self::apply_upsert(&mut memtable, &mut deleted, &segments, parsed);
                 }
                 WalRecord::Delete { id, .. } => {
-                    Self::apply_delete(&mut memtable, &mut deleted, &id);
+                    Self::apply_delete(&mut memtable, &mut deleted, &segments, &id);
                 }
             }
         }
@@ -177,7 +206,7 @@ impl Collection {
             schema,
             layout: layout.clone(),
             config: config.clone(),
-            inner: RwLock::new(Inner { state, wal, memtable, deleted, next_seq }),
+            inner: RwLock::new(Inner { state, wal, memtable, segments, deleted, next_seq }),
         })
     }
 
@@ -221,11 +250,17 @@ impl Collection {
             inner.wal.append_batch(&records)?;
             inner.next_seq = first_seq + accepted.len() as u64;
 
-            let memtable = &mut inner.memtable;
-            for (i, parsed) in accepted {
-                let id = parsed.id.clone();
-                Self::apply_upsert(memtable, parsed);
-                results[i] = Some(DocOutcome::ok(id));
+            {
+                let Inner { memtable, deleted, segments, .. } = &mut *inner;
+                for (i, parsed) in accepted {
+                    let id = parsed.id.clone();
+                    Self::apply_upsert(memtable, deleted, segments, parsed);
+                    results[i] = Some(DocOutcome::ok(id));
+                }
+            }
+
+            if Self::needs_flush_locked(&inner, &self.config) {
+                Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
             }
         }
 
@@ -256,20 +291,24 @@ impl Collection {
         inner.wal.append(&WalRecordRef::Delete { seq, id })?;
         inner.next_seq = seq + 1;
 
-        let Inner { memtable, deleted, .. } = &mut *inner;
-        Ok(Self::apply_delete(memtable, deleted, id))
+        let removed = {
+            let Inner { memtable, deleted, segments, .. } = &mut *inner;
+            Self::apply_delete(memtable, deleted, segments, id)
+        };
+
+        if Self::needs_flush_locked(&inner, &self.config) {
+            Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
+        }
+
+        Ok(removed)
     }
 
     /// Fetch a document's source by id.
     pub fn get(&self, id: &str) -> Result<Json> {
         let inner = self.inner.read();
-        match Self::lookup(&inner, id).and_then(|doc_id| inner.memtable.get(doc_id)) {
-            Some(doc) => Ok(doc.source.clone()),
-            None => Err(Error::DocumentNotFound {
-                collection: self.schema.name.clone(),
-                id: id.to_string(),
-            }),
-        }
+        Self::lookup(&inner, id).and_then(|doc_id| Self::doc_source(&inner, doc_id)).ok_or_else(
+            || Error::DocumentNotFound { collection: self.schema.name.clone(), id: id.to_string() },
+        )
     }
 
     /// Run a search (PRD §7.3).
@@ -281,7 +320,7 @@ impl Collection {
         let request = SearchRequest::resolve(params, &self.schema)?;
 
         let inner = self.inner.read();
-        let ctx = SearchContext::new(&self.schema, vec![&inner.memtable], &inner.deleted);
+        let ctx = SearchContext::new(&self.schema, Self::sources(&inner), &inner.deleted);
         let outcome = execute(&ctx, &request);
 
         let hits = outcome
@@ -290,8 +329,8 @@ impl Collection {
             .filter_map(|scored| {
                 // A hit whose document cannot be fetched would mean the index
                 // and the doc store disagree; skip rather than serve a hole.
-                let doc = inner.memtable.get(scored.doc_id)?;
-                Some(Hit { document: doc.source.clone(), text_match: scored.score })
+                let document = Self::doc_source(&inner, scored.doc_id)?;
+                Some(Hit { document, text_match: scored.score })
             })
             .collect();
 
@@ -314,7 +353,7 @@ impl Collection {
         let request = SuggestRequest::resolve(params, &self.schema)?;
 
         let inner = self.inner.read();
-        let ctx = SearchContext::new(&self.schema, vec![&inner.memtable], &inner.deleted);
+        let ctx = SearchContext::new(&self.schema, Self::sources(&inner), &inner.deleted);
         let suggestions = suggest(&ctx, &request);
 
         Ok(SuggestResponse { suggestions, search_time_ms: started.elapsed().as_millis() as u64 })
@@ -328,9 +367,18 @@ impl Collection {
 
     pub fn stats(&self) -> CollectionStats {
         let inner = self.inner.read();
+        // Not `inner.state.committed_doc_count()`: that subtracts
+        // `state.deleted`, the on-disk snapshot as of the *last* flush.
+        // `inner.deleted` is the live tombstone set, which grows on every
+        // delete or upsert-supersedes-a-segment-doc between flushes — using
+        // the stale snapshot here would overcount until the next flush
+        // happens to catch up.
+        let segment_docs: u64 = inner.state.segments.iter().map(|s| s.doc_count as u64).sum();
+        let num_documents =
+            segment_docs.saturating_sub(inner.deleted.len()) + inner.memtable.len() as u64;
         CollectionStats {
             name: self.schema.name.clone(),
-            num_documents: inner.state.committed_doc_count() + inner.memtable.len() as u64,
+            num_documents,
             num_segments: inner.state.segments.len(),
             memtable_documents: inner.memtable.len(),
             memtable_bytes: inner.memtable.heap_bytes(),
@@ -341,9 +389,18 @@ impl Collection {
 
     /// Whether the memtable has grown past its flush thresholds.
     pub fn needs_flush(&self) -> bool {
-        let inner = self.inner.read();
-        inner.memtable.len() >= self.config.max_memtable_docs
-            || inner.memtable.heap_bytes() >= self.config.max_memtable_bytes
+        Self::needs_flush_locked(&self.inner.read(), &self.config)
+    }
+
+    /// Flush the memtable into a new immutable segment, if anything has been
+    /// allocated since the last flush. Returns whether a flush happened.
+    ///
+    /// Ordinarily triggered automatically once a write crosses
+    /// [`EngineConfig::max_memtable_docs`] or `max_memtable_bytes`; exposed
+    /// directly for tests and for an operator forcing an early flush.
+    pub fn flush(&self) -> Result<bool> {
+        let mut inner = self.inner.write();
+        Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)
     }
 
     /// Data directory this collection occupies.
@@ -353,43 +410,162 @@ impl Collection {
 
     // --- internals -------------------------------------------------------
 
+    fn needs_flush_locked(inner: &Inner, config: &EngineConfig) -> bool {
+        inner.memtable.len() >= config.max_memtable_docs
+            || inner.memtable.heap_bytes() >= config.max_memtable_bytes
+    }
+
+    /// Runs under the same write-lock acquisition as the mutation that
+    /// triggered it — encoding, committing, and retiring the old WAL
+    /// generation all happen before any other write can observe `inner`.
+    /// Splitting this into separate lock acquisitions would let a concurrent
+    /// write's WAL record land with a `seq` at or below the `applied_seq`
+    /// this flush is about to commit, silently excluding it from replay
+    /// forever.
+    fn flush_locked(
+        inner: &mut Inner,
+        schema: &CollectionSchema,
+        layout: &Layout,
+        config: &EngineConfig,
+    ) -> Result<bool> {
+        // Not `memtable.is_empty()`: a memtable can hold zero *live* documents
+        // (everything since the last flush was also deleted) while still
+        // holding postings and columns that need reclaiming — exactly the
+        // case `heap_bytes()`-driven flushing exists to catch.
+        if inner.memtable.next_doc_id() == inner.memtable.base() {
+            return Ok(false);
+        }
+
+        let segment_id = inner.state.next_segment_id;
+        let encoded = encode(&inner.memtable, schema)?;
+        let paths = segment_file_paths(layout, &schema.name, segment_id);
+
+        write_atomic(&paths.terms, &encoded.terms)?;
+        write_atomic(&paths.ids, &encoded.ids)?;
+        write_atomic(&paths.post, &encoded.post)?;
+        write_atomic(&paths.col, &encoded.col)?;
+        write_atomic(&paths.doc, &encoded.doc)?;
+        sync_dir(&layout.segments_dir(&schema.name))?;
+
+        let new_wal_generation = inner.state.wal_generation + 1;
+        let new_wal =
+            Wal::open(layout.wal_file(&schema.name, new_wal_generation), config.sync_policy)?;
+
+        let mut new_state = inner.state.clone();
+        new_state.next_segment_id += 1;
+        new_state.next_doc_id = inner.memtable.next_doc_id();
+        new_state.applied_seq = inner.next_seq - 1;
+        new_state.wal_generation = new_wal_generation;
+        new_state.deleted = inner.deleted.iter().collect();
+        new_state.segments.push(SegmentRef {
+            id: segment_id,
+            doc_count: inner.memtable.len() as u32,
+            min_doc_id: inner.memtable.base(),
+            max_doc_id: inner.memtable.next_doc_id() - 1,
+        });
+
+        // The commit point: a crash before this leaves the previous state
+        // intact and the segment files just written orphaned but harmless,
+        // since nothing outside `state.json` ever names a segment id.
+        meta::write_state(layout, &schema.name, &new_state)?;
+
+        // Everything below is the in-memory mirror of what was just made
+        // durable. `inner.state` in particular must be kept current, not
+        // just written to disk — the *next* flush reads `inner.state` to
+        // compute `next_segment_id` and to extend `segments`, and a stale
+        // read here would silently drop this segment's `SegmentRef` from
+        // that later write even though its files are still on disk.
+        inner.state = new_state;
+        inner.segments.push(Arc::new(SegmentReader::open(&paths, schema)?));
+        inner.memtable = MemTable::new(inner.state.next_doc_id, schema);
+        let old_wal = std::mem::replace(&mut inner.wal, new_wal);
+
+        // Last: losing this before the state.json rename would be
+        // unrecoverable (the WAL is the only durable copy), but losing it
+        // after is just a harmless leftover file.
+        old_wal.remove()?;
+
+        Ok(true)
+    }
+
+    /// Every source a search or suggest request reads through: the memtable,
+    /// then every committed segment, oldest first — matching the executor's
+    /// "memtable first, then committed segments" contract.
+    fn sources(inner: &Inner) -> Vec<&dyn IndexSource> {
+        let mut sources: Vec<&dyn IndexSource> = Vec::with_capacity(1 + inner.segments.len());
+        sources.push(&inner.memtable);
+        sources.extend(inner.segments.iter().map(|s| s.as_ref() as &dyn IndexSource));
+        sources
+    }
+
+    /// A document's stored source, wherever it lives.
+    fn doc_source(inner: &Inner, doc_id: DocId) -> Option<Json> {
+        if let Some(doc) = inner.memtable.get(doc_id) {
+            return Some(doc.source.clone());
+        }
+        inner.segments.iter().rev().find_map(|segment| segment.get(doc_id))
+    }
+
     /// Resolve a user-facing id to an internal doc id.
     ///
     /// The memtable holds the newest version of everything written since the
-    /// last flush, so it is consulted first; only then do committed segments
-    /// matter.
+    /// last flush, so it is consulted first; only then do committed segments,
+    /// newest first. A segment-resident id tombstoned by a later delete must
+    /// never be returned.
     fn lookup(inner: &Inner, id: &str) -> Option<DocId> {
         if let Some(doc_id) = inner.memtable.lookup(id) {
             return Some(doc_id);
         }
-        // Segments are searched newest-first once they exist (M2); a tombstoned
-        // doc id must never be returned.
-        let _ = &inner.deleted;
-        None
+        inner.segments.iter().rev().find_map(|segment| segment.lookup_id(id)).filter(|doc_id| {
+            !inner.deleted.contains(*doc_id)
+        })
     }
 
-    /// Insert a document, retiring any previous version of the same id.
-    fn apply_upsert(memtable: &mut MemTable, doc: ParsedDocument) {
-        let previous = memtable.lookup(&doc.id);
+    /// Insert a document, retiring any previous version of the same id —
+    /// whether that version lives in the memtable or a committed segment.
+    fn apply_upsert(
+        memtable: &mut MemTable,
+        deleted: &mut RoaringBitmap,
+        segments: &[Arc<SegmentReader>],
+        doc: ParsedDocument,
+    ) {
+        let id = doc.id.clone();
+        let previous_in_memtable = memtable.lookup(&id);
         // Insert first: the memtable keys ids to the newest doc id, and
         // removing the old version afterwards must not clear that mapping.
         memtable.insert(doc);
-        if let Some(old) = previous {
+        if let Some(old) = previous_in_memtable {
             memtable.remove(old);
+        } else {
+            // The previous version, if any, lives in a committed segment —
+            // tombstone it there so the same id doesn't resolve to two
+            // documents (stale in the segment, fresh in the memtable).
+            if let Some(old_doc_id) =
+                segments.iter().rev().find_map(|segment| segment.lookup_id(&id))
+            {
+                deleted.insert(old_doc_id);
+            }
         }
     }
 
     /// Retire the current version of `id`, if any. Returns whether it existed.
-    fn apply_delete(memtable: &mut MemTable, deleted: &mut RoaringBitmap, id: &str) -> bool {
-        match memtable.lookup(id) {
-            Some(doc_id) => memtable.remove(doc_id),
-            None => {
-                // Nothing in memory; once segments exist the id is resolved
-                // against them and tombstoned here.
-                let _ = deleted;
-                false
-            }
+    fn apply_delete(
+        memtable: &mut MemTable,
+        deleted: &mut RoaringBitmap,
+        segments: &[Arc<SegmentReader>],
+        id: &str,
+    ) -> bool {
+        if let Some(doc_id) = memtable.lookup(id) {
+            return memtable.remove(doc_id);
         }
+        let Some(doc_id) = segments.iter().rev().find_map(|segment| segment.lookup_id(id)) else {
+            return false;
+        };
+        if deleted.contains(doc_id) {
+            return false; // already tombstoned — deleting twice is not an error
+        }
+        deleted.insert(doc_id);
+        true
     }
 
     #[cfg(test)]
@@ -633,5 +809,183 @@ mod tests {
         }
         let c = Collection::open(&layout, "products", &config).unwrap();
         assert_eq!(c.stats().num_documents, 1);
+    }
+
+    // --- segment flush -----------------------------------------------------
+
+    #[test]
+    fn flush_produces_a_segment_and_empties_the_memtable() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert_batch(vec![product("1", "Wireless Mouse", 2999), product("2", "Keyboard", 4999)])
+            .unwrap();
+
+        assert!(c.flush().unwrap());
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.stats().memtable_documents, 0);
+        assert_eq!(c.stats().num_documents, 2);
+        assert_eq!(c.get("1").unwrap()["title"], json!("Wireless Mouse"));
+
+        assert!(!c.flush().unwrap(), "nothing allocated since the last flush");
+    }
+
+    #[test]
+    fn flush_triggers_automatically_past_the_doc_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.initialize().unwrap();
+        let config = EngineConfig::new(dir.path()).with_max_memtable_docs(2);
+
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+        c.upsert_batch(vec![product("1", "a", 1), product("2", "b", 2)]).unwrap();
+
+        assert_eq!(c.stats().num_segments, 1, "crossing the threshold must flush automatically");
+        assert_eq!(c.stats().memtable_documents, 0);
+        assert_eq!(c.get("1").unwrap()["title"], json!("a"));
+    }
+
+    #[test]
+    fn flushed_data_survives_a_restart_with_replay_bounded_to_post_flush_records() {
+        let h = Harness::new();
+        {
+            let c = h.create();
+            c.upsert_batch(vec![product("1", "a", 1), product("2", "b", 2)]).unwrap();
+            assert!(c.flush().unwrap());
+            c.upsert(product("3", "c", 3)).unwrap(); // one record after the flush
+        }
+
+        let c = h.reopen();
+        assert_eq!(c.stats().num_documents, 3);
+        assert_eq!(c.get("1").unwrap()["title"], json!("a"));
+        assert_eq!(c.get("3").unwrap()["title"], json!("c"));
+
+        // Replay must not need anything the segment already captured.
+        let generation = c.read_inner().state.wal_generation;
+        let records = wal::read(&h.layout.wal_file("products", generation)).unwrap().records;
+        assert_eq!(records.len(), 1, "only the post-flush record should remain in the WAL");
+    }
+
+    #[test]
+    fn upserting_a_segment_resident_document_is_visible_exactly_once() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "Old", 100)).unwrap();
+        assert!(c.flush().unwrap());
+
+        c.upsert(product("1", "New", 200)).unwrap();
+
+        assert_eq!(c.get("1").unwrap()["title"], json!("New"));
+        assert_eq!(
+            c.stats().num_documents,
+            1,
+            "the segment's stale copy must be tombstoned, not left visible alongside the new one"
+        );
+    }
+
+    #[test]
+    fn deleting_a_segment_resident_document_is_durable_across_a_restart() {
+        let h = Harness::new();
+        {
+            let c = h.create();
+            c.upsert(product("1", "Mouse", 100)).unwrap();
+            assert!(c.flush().unwrap());
+
+            assert!(c.delete("1").unwrap());
+            assert!(!c.delete("1").unwrap(), "deleting an already-tombstoned segment doc is a no-op");
+            assert!(matches!(c.get("1"), Err(Error::DocumentNotFound { .. })));
+        }
+
+        let c = h.reopen();
+        assert!(matches!(c.get("1"), Err(Error::DocumentNotFound { .. })));
+        assert_eq!(c.stats().num_documents, 0);
+    }
+
+    #[test]
+    fn two_flushes_in_a_row_both_survive_a_restart() {
+        // Regression test: a flush that forgets to keep `inner.state` current
+        // in memory would compute the second flush's `SegmentRef` list from
+        // the stale pre-first-flush state, silently dropping the first
+        // segment from state.json even though its files are still on disk.
+        let h = Harness::new();
+        {
+            let c = h.create();
+            c.upsert(product("1", "a", 1)).unwrap();
+            assert!(c.flush().unwrap());
+            c.upsert(product("2", "b", 2)).unwrap();
+            assert!(c.flush().unwrap());
+            assert_eq!(c.stats().num_segments, 2);
+        }
+
+        let c = h.reopen();
+        assert_eq!(c.stats().num_segments, 2);
+        assert_eq!(c.stats().num_documents, 2);
+        assert_eq!(c.get("1").unwrap()["title"], json!("a"));
+        assert_eq!(c.get("2").unwrap()["title"], json!("b"));
+    }
+
+    #[test]
+    fn an_all_deleted_memtable_still_flushes_cleanly() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.delete("1").unwrap();
+
+        assert!(c.flush().unwrap(), "a doc id was allocated even though nothing is live");
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.stats().num_documents, 0);
+        assert!(matches!(c.get("1"), Err(Error::DocumentNotFound { .. })));
+
+        let reopened = h.reopen();
+        assert_eq!(reopened.stats().num_segments, 1);
+        assert_eq!(reopened.stats().num_documents, 0);
+    }
+
+    #[test]
+    fn a_stale_orphaned_segment_id_is_safely_overwritten_by_a_real_flush() {
+        // No directory scan ever runs on open — only ids named in
+        // `state.json` are opened — so files left behind by a crash between
+        // writing segment data and committing state.json are inert, and a
+        // later flush reusing that id must simply overwrite them.
+        let h = Harness::new();
+        let c = h.create();
+
+        std::fs::create_dir_all(h.layout.segments_dir("products")).unwrap();
+        for ext in ["terms", "ids", "post", "col", "doc"] {
+            std::fs::write(h.layout.segment_file("products", 1, ext), b"garbage").unwrap();
+        }
+
+        c.upsert(product("1", "Mouse", 100)).unwrap();
+        assert!(c.flush().unwrap());
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.get("1").unwrap()["title"], json!("Mouse"));
+
+        let reopened = h.reopen();
+        assert_eq!(reopened.stats().num_segments, 1);
+        assert_eq!(reopened.get("1").unwrap()["title"], json!("Mouse"));
+    }
+
+    #[test]
+    fn search_and_suggest_see_documents_in_both_memtable_and_segments() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "Wireless Mouse", 2999)).unwrap();
+        assert!(c.flush().unwrap());
+        c.upsert(product("2", "Mechanical Keyboard", 8999)).unwrap();
+
+        let results = c
+            .search(SearchParams {
+                q: Some("mouse keyboard".into()),
+                match_mode: Some("any".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            results.hits.iter().map(|h| h.document["id"].as_str().unwrap().to_string()).collect();
+        assert!(ids.contains("1"), "the segment-resident document must be found");
+        assert!(ids.contains("2"), "the memtable-resident document must be found");
+
+        let suggestions =
+            c.suggest(SuggestParams { q: Some("mo".into()), ..Default::default() }).unwrap();
+        assert!(!suggestions.suggestions.is_empty());
     }
 }

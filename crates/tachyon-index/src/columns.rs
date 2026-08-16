@@ -127,7 +127,7 @@ fn collect_docs(docs: impl Iterator<Item = DocId>) -> RoaringBitmap {
 }
 
 /// Sorted `(value, doc_id)` pairs for one numeric field.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NumericColumn {
     sorted: Vec<(NumKey, DocId)>,
     pending: Vec<(NumKey, DocId)>,
@@ -292,10 +292,23 @@ impl NumericColumn {
     pub fn heap_bytes(&self) -> usize {
         self.len() * std::mem::size_of::<(NumKey, DocId)>()
     }
+
+    /// Build a column directly from an already-sorted vector, with no
+    /// `pending` tail — used when decoding a segment, where nothing writes to
+    /// the column again so there is nothing left to amortize.
+    pub fn from_sorted(sorted: Vec<(NumKey, DocId)>) -> NumericColumn {
+        NumericColumn { sorted, pending: Vec::new() }
+    }
+
+    /// Every `(value, doc)` pair this column holds, in no particular order.
+    /// Used by the segment writer, which sorts and filters live docs itself.
+    pub fn iter(&self) -> impl Iterator<Item = (NumKey, DocId)> + '_ {
+        self.sorted.iter().copied().chain(self.pending.iter().copied())
+    }
 }
 
 /// Value → documents, for keyword equality and facets.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct KeywordColumn {
     by_value: HashMap<Box<str>, RoaringBitmap>,
     /// Documents with any value, so `!=` can exclude without resurrecting
@@ -366,6 +379,22 @@ impl KeywordColumn {
     pub fn heap_bytes(&self) -> usize {
         self.value_bytes + self.entries * std::mem::size_of::<DocId>()
     }
+
+    /// Build a column directly from decoded per-value bitmaps — used when
+    /// decoding a segment. Recomputes the running heap-accounting totals
+    /// [`KeywordColumn::push`] normally maintains incrementally.
+    pub fn from_parts(by_value: HashMap<Box<str>, RoaringBitmap>, present: RoaringBitmap) -> KeywordColumn {
+        let value_bytes =
+            by_value.keys().map(|v| v.len() + std::mem::size_of::<Box<str>>() + 32).sum();
+        let entries = by_value.values().map(RoaringBitmap::len).sum::<u64>() as usize;
+        KeywordColumn { by_value, present, value_bytes, entries }
+    }
+
+    /// Every distinct value with its bitmap. Used by the segment writer,
+    /// which filters and re-serializes them itself.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &RoaringBitmap)> {
+        self.by_value.iter().map(|(v, b)| (v.as_ref(), b))
+    }
 }
 
 /// All columns of one collection, addressed by field id.
@@ -393,6 +422,15 @@ impl Columns {
             keyword.push(k);
         }
 
+        Columns { numeric, keyword }
+    }
+
+    /// Build directly from decoded per-field columns — used when decoding a
+    /// segment, in place of [`Columns::new`]'s schema-driven allocation.
+    pub fn from_parts(
+        numeric: Vec<Option<NumericColumn>>,
+        keyword: Vec<Option<KeywordColumn>>,
+    ) -> Columns {
         Columns { numeric, keyword }
     }
 
