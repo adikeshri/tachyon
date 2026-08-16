@@ -17,8 +17,9 @@ docker run -p 8108:8108 ghcr.io/tachyon-search/tachyon:latest
 > **Status: alpha.** The API is stable enough to build against and every
 > feature below is tested end to end, but this has not run in production
 > anywhere. See [Known limitations](#known-limitations) before you rely on it —
-> in particular, **queries get slower as a collection accumulates segments**,
-> since nothing merges them yet.
+> in particular, **a merge briefly holds everything it's folding together in
+> memory at once**, a real cost worth accounting for when tuning
+> `--merge-fan-in` on a memory-constrained deployment.
 
 ---
 
@@ -124,19 +125,25 @@ corpus**; see [Known limitations](#known-limitations).
 
 Read this before choosing Tachyon.
 
-**Segment count is unbounded.** Writes are durable — they go to a write-ahead
-log and are replayed on startup — and once a memtable crosses
-`--max-memtable-docs`/`--max-memtable-bytes` it is flushed into an immutable,
-mmap'd on-disk segment: postings, columns, and document values are all read
-lazily and decoded only for what a query actually touches, which is what
-keeps memory bounded by how much of the corpus is hot rather than by corpus
-size. What isn't done yet is merging: a query runs over the memtable plus
-every committed segment with nothing folding them back together, so a
-long-lived collection accumulates segments and each one adds its own share of
-per-query overhead. Measured at the default 100k-document flush threshold:
-search p95 was ~9 ms at 100k documents (1 segment), ~88 ms at 1M (10
-segments), ~524 ms at 5M (50 segments). Tiered merges are the next piece of
-work here.
+**A merge briefly holds what it's merging fully in memory.** Writes are
+durable — they go to a write-ahead log and are replayed on startup — and
+once a memtable crosses `--max-memtable-docs`/`--max-memtable-bytes` it is
+flushed into an immutable, mmap'd on-disk segment: postings, columns, and
+document values are all read lazily and decoded only for what a query
+actually touches, which is what keeps memory bounded by how much of the
+corpus is hot rather than by corpus size. A query fans out across the
+memtable plus every committed segment, so segment count on its own drives
+latency up over time; once a collection holds more than
+`--merge-trigger-segments` (default 8), the smallest `--merge-fan-in`
+(default 4) are folded into one right after the flush that crossed that
+line. The trade: a merge rebuilds its input through a scratch memtable
+before re-encoding it, so it briefly holds everything being merged decoded
+at once — measured peak RSS during a 1M-doc run was ~1.5 GiB captured
+mid-merge, settling to ~49 MiB once indexing (including that merge)
+finished. Real, worth accounting for when tuning `--merge-fan-in` on a
+memory-constrained deployment, but momentary, not sustained. A direct
+merge of the already-encoded structures, avoiding the scratch memtable
+entirely, is the natural follow-up if this proves to matter in practice.
 
 **Broad queries scale linearly.** Every matching document is scored. Real
 catalogues are far more selective than a broad query — and adding a filter
@@ -162,6 +169,8 @@ Every flag has an environment variable equivalent.
 | `--data-dir` | `TACHYON_DATA_DIR` | `./data` | Collections, WAL, segments |
 | `--sync-interval-ms` | `TACHYON_SYNC_INTERVAL_MS` | `0` | `0` fsyncs every write; higher trades durability for throughput |
 | `--max-memtable-docs` | `TACHYON_MAX_MEMTABLE_DOCS` | `100000` | Flush threshold |
+| `--merge-trigger-segments` | `TACHYON_MERGE_TRIGGER_SEGMENTS` | `8` | Merge once a collection holds more segments than this |
+| `--merge-fan-in` | `TACHYON_MERGE_FAN_IN` | `4` | Segments merged at once — smallest by document count |
 | `--admin-key` | `TACHYON_ADMIN_KEY` | unset | Read/write API key |
 | `--search-key` | `TACHYON_SEARCH_KEY` | unset | Read-only API key |
 | `--log` | `TACHYON_LOG` | `info` | `tracing` filter |

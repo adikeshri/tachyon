@@ -403,6 +403,15 @@ impl Collection {
         Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)
     }
 
+    /// Force a merge check right now, if segment count crosses the
+    /// configured threshold. Ordinarily triggered automatically right after
+    /// a flush; exposed directly for tests and for an operator forcing one
+    /// early. Returns whether a merge actually happened.
+    pub fn merge(&self) -> Result<bool> {
+        let mut inner = self.inner.write();
+        Self::merge_locked(&mut inner, &self.schema, &self.layout, &self.config)
+    }
+
     /// Data directory this collection occupies.
     pub fn directory(&self) -> std::path::PathBuf {
         self.layout.collection_dir(&self.schema.name)
@@ -485,6 +494,169 @@ impl Collection {
         // after is just a harmless leftover file.
         old_wal.remove()?;
 
+        if Self::needs_merge_locked(inner, config) {
+            Self::merge_locked(inner, schema, layout, config)?;
+        }
+
+        Ok(true)
+    }
+
+    fn needs_merge_locked(inner: &Inner, config: &EngineConfig) -> bool {
+        inner.state.segments.len() > config.merge_trigger_segments
+    }
+
+    /// Folds the `merge_fan_in` smallest segments (by document count) into
+    /// one. Runs under the same write-lock acquisition as the flush that
+    /// triggered it, immediately after that flush's own commit — same
+    /// reasoning as `flush_locked`'s doc comment: one lock, one commit
+    /// point, no window where a concurrent write could observe a
+    /// half-finished state.
+    ///
+    /// A merge renumbers rather than preserves doc ids. `SegmentRef`'s
+    /// range is fixed for a segment's life and doc ids are never reused, so
+    /// preserving the originals across a merge would mean building a new
+    /// on-disk segment out of two *already-encoded* ones — a from-scratch
+    /// k-way merge of sorted term dictionaries and postings, with nothing
+    /// in this codebase to build that on top of. Renumbering instead means
+    /// a merge is just: fetch each live document's source, run it through
+    /// the exact same `ParsedDocument::parse` + `MemTable::insert` path a
+    /// fresh write already takes, and call the existing `encode` on the
+    /// result — the entire pipeline is reused unchanged, and the only new
+    /// code here is picking victims and updating the commit state. The
+    /// cost is re-tokenizing every merged document; that's fine because a
+    /// merge is infrequent background-ish work, not a query-path cost.
+    /// Doc ids retired this way are simply never claimed again — no
+    /// segment or memtable ever covers that range afterward — except that
+    /// `inner.deleted` can hold stale tombstones for them, which this
+    /// prunes explicitly.
+    ///
+    /// A no-op, not an error, when there are fewer than `merge_fan_in`
+    /// segments to work with.
+    fn merge_locked(
+        inner: &mut Inner,
+        schema: &CollectionSchema,
+        layout: &Layout,
+        config: &EngineConfig,
+    ) -> Result<bool> {
+        if inner.state.segments.len() < config.merge_fan_in {
+            return Ok(false);
+        }
+
+        // The `merge_fan_in` smallest by doc_count, ties broken by id for a
+        // deterministic choice. `inner.segments` and `inner.state.segments`
+        // are always the same length and order — both only ever change
+        // together, here and in `flush_locked` — so an index into one is
+        // valid for the other.
+        let mut by_size: Vec<usize> = (0..inner.state.segments.len()).collect();
+        by_size.sort_by_key(|&i| (inner.state.segments[i].doc_count, inner.state.segments[i].id));
+        let mut victims: Vec<usize> = by_size.into_iter().take(config.merge_fan_in).collect();
+        victims.sort_unstable(); // ascending index order, i.e. creation order
+
+        let victim_refs: Vec<SegmentRef> =
+            victims.iter().map(|&i| inner.state.segments[i].clone()).collect();
+        let victim_readers: Vec<Arc<SegmentReader>> =
+            victims.iter().map(|&i| Arc::clone(&inner.segments[i])).collect();
+
+        // Rebuild: every live, non-tombstoned document across the victims,
+        // re-validated and re-tokenized exactly like a fresh insert.
+        let merge_base = inner.state.next_doc_id;
+        let mut merged = MemTable::new(merge_base, schema);
+        for reader in &victim_readers {
+            for doc_id in reader.min_doc_id()..reader.end_doc_id() {
+                if !reader.is_live(doc_id) || inner.deleted.contains(doc_id) {
+                    continue;
+                }
+                let Some(source) = reader.get(doc_id) else { continue };
+                let parsed = ParsedDocument::parse(source, schema).map_err(|e| {
+                    Error::corruption(format!(
+                        "segment doc {doc_id} failed to re-parse during merge: {e}"
+                    ))
+                })?;
+                merged.insert(parsed);
+            }
+        }
+
+        let mut new_state = inner.state.clone();
+
+        // Tombstones for ids no segment will ever claim again — the merge
+        // output starts fresh, so nothing later needs to know these were
+        // once deleted. Pruned from the live bitmap too, not just the
+        // serialized snapshot: `stats()` subtracts `inner.deleted.len()`
+        // from the summed segment doc counts, and a stale entry for an id
+        // no segment counts anymore would silently undercount forever.
+        for old in &victim_refs {
+            inner.deleted.remove_range(old.min_doc_id..=old.max_doc_id);
+        }
+        new_state.deleted = inner.deleted.iter().collect();
+
+        // Remove the victims, highest index first so an earlier removal
+        // never shifts the index of one still to come.
+        for &i in victims.iter().rev() {
+            new_state.segments.remove(i);
+        }
+
+        // Every document merged away was dead — nothing to write, the
+        // victims simply disappear with no replacement.
+        let wrote_segment = merged.next_doc_id() > merged.base();
+        let mut new_reader = None;
+        if wrote_segment {
+            let segment_id = new_state.next_segment_id;
+            let encoded = encode(&merged, schema)?;
+            let paths = segment_file_paths(layout, &schema.name, segment_id);
+
+            write_atomic(&paths.terms, &encoded.terms)?;
+            write_atomic(&paths.ids, &encoded.ids)?;
+            write_atomic(&paths.post, &encoded.post)?;
+            write_atomic(&paths.col, &encoded.col)?;
+            write_atomic(&paths.doc, &encoded.doc)?;
+            sync_dir(&layout.segments_dir(&schema.name))?;
+
+            new_state.next_segment_id += 1;
+            new_state.next_doc_id = merged.next_doc_id();
+            // `victims[0]` is the smallest victim index, which — now that
+            // every victim has been removed — equals the number of
+            // untouched segments that came before it. Inserting there puts
+            // the merged segment exactly where the earliest victim used to
+            // sit, preserving relative recency against every segment not
+            // involved in this merge.
+            new_state.segments.insert(
+                victims[0],
+                SegmentRef {
+                    id: segment_id,
+                    doc_count: merged.len() as u32,
+                    min_doc_id: merged.base(),
+                    max_doc_id: merged.next_doc_id() - 1,
+                },
+            );
+            new_reader = Some(Arc::new(SegmentReader::open(&paths, schema)?));
+        }
+
+        // The commit point: a crash before this leaves the previous state
+        // intact and any new segment files just written orphaned but
+        // harmless, for exactly the same reason a flush's are.
+        meta::write_state(layout, &schema.name, &new_state)?;
+
+        inner.state = new_state;
+        for &i in victims.iter().rev() {
+            inner.segments.remove(i);
+        }
+        if let Some(reader) = new_reader {
+            inner.segments.insert(victims[0], reader);
+        }
+
+        // Cleanup, strictly after the commit. Safe with no concurrent-access
+        // hazard: a search only ever borrows a source for the duration of
+        // one read-lock hold — the borrow checker ties `&dyn IndexSource` to
+        // that guard's lifetime — and this runs under the exclusive write
+        // lock, so no in-flight reader can be holding a victim when this
+        // executes; `victim_readers` here is this function's own clone, kept
+        // alive until it drops at the end regardless.
+        for old in &victim_refs {
+            for ext in ["terms", "ids", "post", "col", "doc"] {
+                let _ = std::fs::remove_file(layout.segment_file(&schema.name, old.id, ext));
+            }
+        }
+
         Ok(true)
     }
 
@@ -516,9 +688,12 @@ impl Collection {
         if let Some(doc_id) = inner.memtable.lookup(id) {
             return Some(doc_id);
         }
-        inner.segments.iter().rev().find_map(|segment| segment.lookup_id(id)).filter(|doc_id| {
-            !inner.deleted.contains(*doc_id)
-        })
+        inner
+            .segments
+            .iter()
+            .rev()
+            .find_map(|segment| segment.lookup_id(id))
+            .filter(|doc_id| !inner.deleted.contains(*doc_id))
     }
 
     /// Insert a document, retiring any previous version of the same id —
@@ -891,7 +1066,10 @@ mod tests {
             assert!(c.flush().unwrap());
 
             assert!(c.delete("1").unwrap());
-            assert!(!c.delete("1").unwrap(), "deleting an already-tombstoned segment doc is a no-op");
+            assert!(
+                !c.delete("1").unwrap(),
+                "deleting an already-tombstoned segment doc is a no-op"
+            );
             assert!(matches!(c.get("1"), Err(Error::DocumentNotFound { .. })));
         }
 
@@ -987,5 +1165,196 @@ mod tests {
         let suggestions =
             c.suggest(SuggestParams { q: Some("mo".into()), ..Default::default() }).unwrap();
         assert!(!suggestions.suggestions.is_empty());
+    }
+
+    // --- tiered merges -------------------------------------------------
+
+    /// A collection whose every flush produces a 2-document segment, so a
+    /// handful of upserts is enough to drive several flushes deterministically.
+    fn merge_harness(
+        merge_trigger_segments: usize,
+        merge_fan_in: usize,
+    ) -> (tempfile::TempDir, Layout, EngineConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.initialize().unwrap();
+        let config = EngineConfig::new(dir.path())
+            .with_max_memtable_docs(2)
+            .with_merge_trigger_segments(merge_trigger_segments)
+            .with_merge_fan_in(merge_fan_in);
+        (dir, layout, config)
+    }
+
+    #[test]
+    fn merging_the_smallest_segments_preserves_every_live_document() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        // Three flushes of 2 docs each (max_memtable_docs=2) would normally
+        // leave 3 segments, but the third flush's own auto-merge check sees
+        // segments.len()=3 > trigger=2 and immediately folds the two
+        // smallest (the first two, tied at doc_count=2) into one.
+        for i in 0..6 {
+            c.upsert(product(&(i + 1).to_string(), &format!("item {i}"), 100 + i)).unwrap();
+        }
+        assert_eq!(c.stats().num_segments, 2);
+        assert_eq!(c.stats().num_documents, 6);
+
+        for i in 1..=6 {
+            let doc = c.get(&i.to_string()).unwrap();
+            assert_eq!(doc["title"], json!(format!("item {}", i - 1)));
+        }
+
+        let results = c
+            .search(SearchParams {
+                q: Some("item".into()),
+                match_mode: Some("any".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.found, 6);
+    }
+
+    #[test]
+    fn merge_triggers_automatically_without_a_manual_call() {
+        let (_dir, layout, config) = merge_harness(1, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        // trigger=1: a merge is attempted after every flush past 1 segment.
+        for i in 0..8 {
+            c.upsert(product(&(i + 1).to_string(), "x", i)).unwrap();
+        }
+        // 4 flushes of 2 docs; merges should have kept segment count from
+        // growing unboundedly rather than sitting at 4.
+        assert!(c.stats().num_segments < 4, "merging should have kept segment count down");
+        assert_eq!(c.stats().num_documents, 8);
+    }
+
+    #[test]
+    fn a_document_deleted_before_a_merge_does_not_reappear() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap(); // segment 1: [1,2]
+        assert!(c.delete("2").unwrap()); // tombstoned in a committed segment
+
+        c.upsert(product("3", "c", 3)).unwrap();
+        c.upsert(product("4", "d", 4)).unwrap(); // segment 2: [3,4]
+        c.upsert(product("5", "e", 5)).unwrap();
+        c.upsert(product("6", "f", 6)).unwrap(); // segment 3: [5,6] -> triggers merge
+
+        assert_eq!(c.stats().num_documents, 5, "\"2\" stays deleted through the merge");
+        assert!(matches!(c.get("2"), Err(Error::DocumentNotFound { .. })));
+        for id in ["1", "3", "4", "5", "6"] {
+            assert!(c.get(id).is_ok(), "doc {id} should have survived the merge");
+        }
+    }
+
+    #[test]
+    fn a_document_from_a_merged_segment_can_still_be_deleted_afterward() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        for i in 0..6 {
+            c.upsert(product(&(i + 1).to_string(), "x", i)).unwrap();
+        }
+        assert_eq!(c.stats().num_segments, 2, "the merge already ran");
+
+        // "1" was in the very first (now-merged-away) segment. Deleting it
+        // now must resolve through the *new* merged segment's id index.
+        assert!(c.delete("1").unwrap());
+        assert!(matches!(c.get("1"), Err(Error::DocumentNotFound { .. })));
+        assert_eq!(c.stats().num_documents, 5);
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert!(matches!(reopened.get("1"), Err(Error::DocumentNotFound { .. })));
+        assert_eq!(reopened.stats().num_documents, 5);
+    }
+
+    #[test]
+    fn a_merge_set_that_is_entirely_dead_leaves_no_replacement_segment() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap(); // segment 1
+        assert!(c.delete("1").unwrap());
+        assert!(c.delete("2").unwrap()); // segment 1 is now entirely dead
+
+        c.upsert(product("3", "c", 3)).unwrap();
+        c.upsert(product("4", "d", 4)).unwrap(); // segment 2, still fully live
+
+        // Force the merge explicitly rather than relying on a third flush,
+        // so this test exercises exactly the two segments above.
+        assert!(c.merge().unwrap());
+
+        assert_eq!(
+            c.stats().num_segments,
+            1,
+            "the fully-dead segment vanished with no replacement"
+        );
+        assert_eq!(c.stats().num_documents, 2);
+        assert!(c.get("3").is_ok());
+        assert!(c.get("4").is_ok());
+    }
+
+    #[test]
+    fn merge_survives_a_restart_and_retires_the_old_segment_files() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let old_segment_files: Vec<std::path::PathBuf>;
+        {
+            let c = Collection::create(&layout, schema(), &config).unwrap();
+            for i in 0..6 {
+                c.upsert(product(&(i + 1).to_string(), "x", i)).unwrap();
+            }
+            assert_eq!(c.stats().num_segments, 2);
+            // Segment id 1 was one of the two merge victims (smallest/first);
+            // its files must be gone once the merge committed.
+            old_segment_files = ["terms", "ids", "post", "col", "doc"]
+                .iter()
+                .map(|ext| layout.segment_file("products", 1, ext))
+                .collect();
+            for path in &old_segment_files {
+                assert!(!path.exists(), "{path:?} should have been retired by the merge");
+            }
+        }
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_segments, 2);
+        assert_eq!(reopened.stats().num_documents, 6);
+        for i in 1..=6 {
+            assert!(reopened.get(&i.to_string()).is_ok());
+        }
+        for path in &old_segment_files {
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn a_stale_orphaned_merge_output_id_is_safely_overwritten() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap(); // segment id 1
+        c.upsert(product("3", "c", 3)).unwrap();
+        c.upsert(product("4", "d", 4)).unwrap(); // segment id 2
+
+        // The next segment id (3) is what the upcoming merge will claim.
+        // Simulate a crash that left garbage there from a previous attempt.
+        for ext in ["terms", "ids", "post", "col", "doc"] {
+            std::fs::write(layout.segment_file("products", 3, ext), b"garbage").unwrap();
+        }
+
+        assert!(c.merge().unwrap(), "the real merge must overwrite the orphaned files at id 3");
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.stats().num_documents, 4);
+        for i in 1..=4 {
+            assert!(c.get(&i.to_string()).is_ok());
+        }
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, 4);
     }
 }

@@ -156,13 +156,16 @@ impl<'a> Cursor<'a> {
 // numeric/bool `value` genuinely zero-copy: the mmap'd page is touched, but
 // nothing is parsed or allocated.
 
-fn slice_at<'a>(bytes: &'a [u8], offset: usize, len: usize, what: &'static str) -> Result<&'a [u8]> {
+fn slice_at<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    len: usize,
+    what: &'static str,
+) -> Result<&'a [u8]> {
     let end = offset
         .checked_add(len)
         .ok_or_else(|| Error::corruption(format!("{what}: offset overflow")))?;
-    bytes
-        .get(offset..end)
-        .ok_or_else(|| Error::corruption(format!("{what}: offset out of range")))
+    bytes.get(offset..end).ok_or_else(|| Error::corruption(format!("{what}: offset out of range")))
 }
 
 pub fn u8_at(bytes: &[u8], offset: usize, what: &'static str) -> Result<u8> {
@@ -181,6 +184,11 @@ pub fn f64_at(bytes: &[u8], offset: usize, what: &'static str) -> Result<f64> {
     Ok(f64::from_le_bytes(slice_at(bytes, offset, 8, what)?.try_into().expect("8 bytes")))
 }
 
-pub fn bytes_at<'a>(bytes: &'a [u8], offset: usize, len: usize, what: &'static str) -> Result<&'a [u8]> {
+pub fn bytes_at<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    len: usize,
+    what: &'static str,
+) -> Result<&'a [u8]> {
     slice_at(bytes, offset, len, what)
 }

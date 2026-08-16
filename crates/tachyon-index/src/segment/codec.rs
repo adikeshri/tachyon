@@ -32,8 +32,8 @@ use crate::memtable::MemTable;
 
 use super::format::{
     bytes_at, f64_at, i64_at, u32_at, u8_at, write_bytes, write_f64, write_header, write_i64,
-    write_str, write_u32, write_u64, write_u8, Cursor, COL_MAGIC, DOC_MAGIC, HEADER_LEN,
-    IDS_MAGIC, POST_MAGIC, TERMS_MAGIC,
+    write_str, write_u32, write_u64, write_u8, Cursor, COL_MAGIC, DOC_MAGIC, HEADER_LEN, IDS_MAGIC,
+    POST_MAGIC, TERMS_MAGIC,
 };
 
 /// The five byte blobs one segment is made of, ready to be written to disk.
@@ -436,7 +436,9 @@ pub(crate) fn decode_numeric_column(
             NUMKEY_TAG_INT => NumKey::Int(cur.read_i64()?),
             NUMKEY_TAG_FLOAT => NumKey::Float(cur.read_f64()?),
             other => {
-                return Err(Error::corruption(format!("segment columns: bad numeric key tag {other}")))
+                return Err(Error::corruption(format!(
+                    "segment columns: bad numeric key tag {other}"
+                )))
             }
         };
         let doc_id = cur.read_u32()?;
@@ -605,7 +607,11 @@ fn encode_docs(memtable: &MemTable, schema: &CollectionSchema) -> Vec<u8> {
 
             let value = doc.values.get(f).unwrap_or(&Value::Null);
             let slot_pos = idx * num_fields * VALUE_SLOT_LEN + f * VALUE_SLOT_LEN;
-            encode_value_slot(&mut values_dir[slot_pos..slot_pos + VALUE_SLOT_LEN], value, &mut strings);
+            encode_value_slot(
+                &mut values_dir[slot_pos..slot_pos + VALUE_SLOT_LEN],
+                value,
+                &mut strings,
+            );
         }
 
         let source_bytes =
@@ -681,7 +687,9 @@ pub(crate) fn decode_doc_header(bytes: &[u8]) -> Result<DocHeader> {
     let source_start = strings_start + strings_len;
     let expected_end = source_start + source_len;
     if expected_end > bytes.len() {
-        return Err(Error::corruption("segment doc store: sections run past end of file".to_string()));
+        return Err(Error::corruption(
+            "segment doc store: sections run past end of file".to_string(),
+        ));
     }
 
     Ok(DocHeader {
@@ -706,7 +714,12 @@ fn doc_index(header: &DocHeader, doc_id: DocId) -> Result<usize> {
 }
 
 /// BM25's `|d|`. Direct offset read, no decode, no allocation.
-pub(crate) fn field_len_at(bytes: &[u8], header: &DocHeader, doc_id: DocId, field: FieldId) -> Result<u32> {
+pub(crate) fn field_len_at(
+    bytes: &[u8],
+    header: &DocHeader,
+    doc_id: DocId,
+    field: FieldId,
+) -> Result<u32> {
     let idx = doc_index(header, doc_id)?;
     if field as usize >= header.num_fields {
         return Ok(0);
@@ -718,12 +731,19 @@ pub(crate) fn field_len_at(bytes: &[u8], header: &DocHeader, doc_id: DocId, fiel
 /// A document's value for one field. Zero-copy in spirit for `Null`/`Bool`/
 /// `Int`/`Float` — the returned `Value` owns nothing that wasn't already a
 /// stack value. `Str`/`Array` pay one decode of just that field's bytes.
-pub(crate) fn value_at(bytes: &[u8], header: &DocHeader, doc_id: DocId, field: FieldId) -> Result<Option<Value>> {
+pub(crate) fn value_at(
+    bytes: &[u8],
+    header: &DocHeader,
+    doc_id: DocId,
+    field: FieldId,
+) -> Result<Option<Value>> {
     let idx = doc_index(header, doc_id)?;
     if field as usize >= header.num_fields {
         return Ok(None);
     }
-    let pos = header.values_dir_start + idx * header.num_fields * VALUE_SLOT_LEN + field as usize * VALUE_SLOT_LEN;
+    let pos = header.values_dir_start
+        + idx * header.num_fields * VALUE_SLOT_LEN
+        + field as usize * VALUE_SLOT_LEN;
     let what = "segment doc store (value)";
     let tag = u8_at(bytes, pos, what)?;
     let value = match tag {
@@ -967,7 +987,11 @@ mod tests {
 
         assert_eq!(
             value_at(&encoded.doc, &header, 0, 1).unwrap().unwrap(),
-            Value::Array(vec![Value::Str("a".into()), Value::Str("b".into()), Value::Str("c".into())])
+            Value::Array(vec![
+                Value::Str("a".into()),
+                Value::Str("b".into()),
+                Value::Str("c".into())
+            ])
         );
         assert_eq!(value_at(&encoded.doc, &header, 0, 2).unwrap().unwrap(), Value::Int(42));
         assert_eq!(value_at(&encoded.doc, &header, 0, 3).unwrap().unwrap(), Value::Float(3.5));
