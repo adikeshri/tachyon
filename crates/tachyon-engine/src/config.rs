@@ -18,6 +18,17 @@ pub struct EngineConfig {
     /// Counts the stored documents, the inverted index, and the columns — the
     /// index alone is usually the larger half.
     pub max_memtable_bytes: usize,
+    /// Attempt a merge once a collection holds more than this many committed
+    /// segments. Each flush checks this once, after its own commit — a
+    /// search fans out across every committed segment with nothing merging
+    /// them back together, so segment count (not corpus size alone) is what
+    /// drives query latency up over a collection's life.
+    pub merge_trigger_segments: usize,
+    /// How many segments one merge folds together — the smallest this many
+    /// by document count, size-tiered in spirit. At most one merge runs per
+    /// flush, so segment count converges down over several flushes rather
+    /// than in one large pause.
+    pub merge_fan_in: usize,
 }
 
 impl Default for EngineConfig {
@@ -29,6 +40,8 @@ impl Default for EngineConfig {
             // being large enough that segment count stays manageable.
             max_memtable_docs: 100_000,
             max_memtable_bytes: 256 * 1024 * 1024,
+            merge_trigger_segments: 8,
+            merge_fan_in: 4,
         }
     }
 }
@@ -51,6 +64,16 @@ impl EngineConfig {
 
     pub fn with_max_memtable_docs(mut self, docs: usize) -> Self {
         self.max_memtable_docs = docs;
+        self
+    }
+
+    pub fn with_merge_trigger_segments(mut self, segments: usize) -> Self {
+        self.merge_trigger_segments = segments;
+        self
+    }
+
+    pub fn with_merge_fan_in(mut self, fan_in: usize) -> Self {
+        self.merge_fan_in = fan_in;
         self
     }
 }

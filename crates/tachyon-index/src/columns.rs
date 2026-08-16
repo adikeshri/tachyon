@@ -383,7 +383,10 @@ impl KeywordColumn {
     /// Build a column directly from decoded per-value bitmaps — used when
     /// decoding a segment. Recomputes the running heap-accounting totals
     /// [`KeywordColumn::push`] normally maintains incrementally.
-    pub fn from_parts(by_value: HashMap<Box<str>, RoaringBitmap>, present: RoaringBitmap) -> KeywordColumn {
+    pub fn from_parts(
+        by_value: HashMap<Box<str>, RoaringBitmap>,
+        present: RoaringBitmap,
+    ) -> KeywordColumn {
         let value_bytes =
             by_value.keys().map(|v| v.len() + std::mem::size_of::<Box<str>>() + 32).sum();
         let entries = by_value.values().map(RoaringBitmap::len).sum::<u64>() as usize;

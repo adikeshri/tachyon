@@ -249,18 +249,56 @@ write throughput under concurrent search becomes the bottleneck — the next
 step would be an atomically-swapped read snapshot so searches never block at
 all.
 
-## What is not built yet
+## Merges
 
-**Tiered merges.** Nothing yet bounds how many segments a long-lived
-collection accumulates, or reclaims the space a document occupies across a
-delete-then-merge. This is the more pressing of the two remaining gaps:
-`SearchContext.sources` is a flat `Vec`, so a query fans out across the
-memtable plus every committed segment with nothing merging them back down,
-and each segment pays its own decode independently. Measured search p95 over
-HTTP, default 100k-document flush threshold: ~9ms at 100k docs (1 segment),
-~88ms at 1M (10 segments), ~524ms at 5M (50 segments) — segment count, not
-corpus size alone, is doing most of that. Bounding it is what fixes that.
+A search fans out across the memtable plus every committed segment, and
+each segment pays its own decode independently — so segment count, not
+corpus size alone, drives query latency up over a collection's life. A merge
+folds several small segments into one, keeping that count from growing
+without bound: once a collection holds more than `merge_trigger_segments`
+segments (default 8), the flush that crossed that line also picks the
+`merge_fan_in` smallest by document count (default 4, size-tiered in
+spirit) and merges them, right after its own commit and under the same
+write-lock hold. At most one merge per flush, so segment count converges
+down over several flushes rather than in one large pause.
+
+**A merge renumbers documents, it does not preserve their ids.** A segment's
+doc-id range is fixed for its life (see "Segments" above), so folding two
+already-committed segments together while keeping their original ids would
+mean merging two already-*encoded* structures — a from-scratch k-way merge of
+sorted term dictionaries and postings. Renumbering sidesteps that entirely:
+a merge fetches each live, non-tombstoned document's source through
+`SegmentReader::get`, runs it back through `ParsedDocument::parse` — the
+exact validation and tokenization a fresh insert already does — and feeds
+the result into a scratch `MemTable`, then calls the ordinary `encode` on
+it. The entire insert/encode pipeline is reused unchanged; the only new
+code is picking victims and updating the commit state. Retired ids are
+simply never claimed again, and any tombstones for them are pruned from
+`state.json`'s `deleted` list as part of the merge's own commit, the same
+way a flush's own commit is the point of no return.
+
+The cost of that reuse is a **transient memory spike while a merge is in
+flight**: rebuilding `merge_fan_in` segments' worth of live documents into a
+scratch memtable before encoding it means the merge briefly holds all of
+them decoded at once, proportional to `merge_fan_in × segment size` rather
+than to the corpus as a whole. Measured directly: peak RSS during a 1M-doc
+run with default settings was ~1.5 GiB captured mid-merge, but memory back
+at rest immediately after indexing finished (no merge in flight, no queries
+yet run) was ~49 MiB. It's a real, momentary cost worth accounting for when
+sizing `merge_fan_in` on a memory-constrained deployment — smaller values
+trade a bigger memory ceiling for more frequent, cheaper merges — but it is
+not sustained.
+
+## What is not built yet
 
 **Block-max WAND.** The executor scores every match. Early termination would
 let it skip documents that cannot reach the top-K, which is what broad queries
-on large corpora need — independent of, and complementary to, tiered merges.
+on large corpora need.
+
+**Streaming merges.** A merge currently rebuilds its input through a scratch
+memtable rather than merging the already-encoded structures directly, which
+is what causes the transient memory spike above. A direct k-way merge of
+sorted term dictionaries, columns, and doc stores across segments would
+avoid materializing anything beyond what's being written — real, novel code
+this workspace doesn't have yet, deferred until the spike above is shown to
+matter in practice.

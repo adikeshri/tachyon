@@ -20,7 +20,12 @@ pub struct SegmentRef {
     pub doc_count: u32,
     /// Inclusive range of internal doc ids the segment covers. Doc ids are
     /// globally increasing within a collection and never reassigned, so a
-    /// segment's range is fixed for its lifetime and merges preserve ids.
+    /// segment's range is fixed for its lifetime. A merge does *not* reuse
+    /// the ranges of the segments it retires — it allocates a fresh range
+    /// the same way a flush does, which is what lets it rebuild a segment
+    /// through the ordinary insert/encode path instead of merging two
+    /// already-encoded segments together. The old ids are simply never
+    /// claimed by anything again.
     pub min_doc_id: DocId,
     pub max_doc_id: DocId,
 }

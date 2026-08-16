@@ -34,6 +34,17 @@ struct Args {
     #[arg(long, env = "TACHYON_MAX_MEMTABLE_DOCS", default_value_t = 100_000)]
     max_memtable_docs: usize,
 
+    /// Attempt a merge once a collection holds more than this many committed
+    /// segments. Query latency grows with segment count, not just corpus
+    /// size, so this bounds how far it's allowed to grow.
+    #[arg(long, env = "TACHYON_MERGE_TRIGGER_SEGMENTS", default_value_t = 8)]
+    merge_trigger_segments: usize,
+
+    /// How many segments one merge folds together — the smallest this many
+    /// by document count.
+    #[arg(long, env = "TACHYON_MERGE_FAN_IN", default_value_t = 4)]
+    merge_fan_in: usize,
+
     /// Admin API key: full read and write access. Leave unset to run without
     /// authentication, which is fine locally and not on a public network.
     #[arg(long, env = "TACHYON_ADMIN_KEY")]
@@ -74,6 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SyncPolicy::Interval(Duration::from_millis(args.sync_interval_ms))
         },
         max_memtable_docs: args.max_memtable_docs,
+        merge_trigger_segments: args.merge_trigger_segments,
+        merge_fan_in: args.merge_fan_in,
         ..Default::default()
     };
 
