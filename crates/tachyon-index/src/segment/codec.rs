@@ -27,7 +27,7 @@ use serde_json::Value as Json;
 use tachyon_core::{CollectionSchema, DocId, Error, FieldId, Result, Value};
 
 use crate::columns::{KeywordColumn, NumKey, NumericColumn};
-use crate::inverted::{DocPosting, FieldPostings};
+use crate::inverted::DocPosting;
 use crate::memtable::MemTable;
 
 use super::format::{
@@ -99,6 +99,41 @@ fn encode_ids(memtable: &MemTable) -> Result<Vec<u8>> {
 
 // --- postings + terms --------------------------------------------------
 
+/// Fixed number of docs per posting block: small enough that a block's
+/// `max_tf` tracks the true local maximum closely (a tight bound is what
+/// makes block-level pruning worth doing), large enough that the directory
+/// overhead per term stays trivial — a 10,000-doc term needs ~79 blocks ×
+/// 20 bytes ≈ 1.5 KB.
+pub(crate) const POSTING_BLOCK_SIZE: usize = 128;
+
+/// Fixed-width per-block skip metadata: lets a query decide whether to skip
+/// a block, or jump straight to one, without decoding a single posting
+/// inside it. 20 bytes on disk.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockMeta {
+    pub last_doc_id: DocId,
+    pub max_tf: u32,
+    /// Absolute byte offset of this block's payload, into the same `.post`
+    /// byte slice `decode_term_field_blocks` was called with.
+    pub offset: u64,
+    pub length: u32,
+}
+
+fn write_block_meta(buf: &mut Vec<u8>, meta: &BlockMeta) {
+    write_u32(buf, meta.last_doc_id);
+    write_u32(buf, meta.max_tf);
+    write_u64(buf, meta.offset);
+    write_u32(buf, meta.length);
+}
+
+fn read_block_meta(cur: &mut Cursor) -> Result<BlockMeta> {
+    let last_doc_id = cur.read_u32()?;
+    let max_tf = cur.read_u32()?;
+    let offset = cur.read_u64()?;
+    let length = cur.read_u32()?;
+    Ok(BlockMeta { last_doc_id, max_tf, offset, length })
+}
+
 fn encode_postings(
     memtable: &MemTable,
     live: &RoaringBitmap,
@@ -150,7 +185,10 @@ fn encode_postings(
     let terms = wrap_fst(TERMS_MAGIC, fst_bytes);
 
     // Postings data, term by term, with an offset table so any one term's
-    // block can be located and decoded without touching the others.
+    // block can be located and decoded without touching the others. Within a
+    // term, each field's postings are further chunked into fixed-size blocks
+    // with their own skip-metadata directory (`BlockMeta`) — see this file's
+    // module doc and `SEGMENT_FORMAT_VERSION`'s doc comment for the shape.
     let mut data = Vec::new();
     let mut offsets = Vec::with_capacity(blocks.len());
     for block in &blocks {
@@ -158,14 +196,42 @@ fn encode_postings(
         write_u32(&mut data, block.fields.len() as u32);
         for (field, docs) in &block.fields {
             write_u32(&mut data, *field as u32);
-            write_u32(&mut data, docs.len() as u32);
-            for posting in docs {
-                write_u32(&mut data, posting.doc_id);
-                write_u32(&mut data, posting.positions.len() as u32);
-                for &p in &posting.positions {
-                    write_u32(&mut data, p);
+            write_u32(&mut data, docs.len() as u32); // doc_freq: O(1) to read back
+
+            let chunks: Vec<&[&DocPosting]> = docs.chunks(POSTING_BLOCK_SIZE).collect();
+            write_u32(&mut data, chunks.len() as u32);
+
+            // Two-pass: build every block's payload bytes into a scratch
+            // buffer first, so each block's own offset (relative to where
+            // this field's payloads begin) is known before its directory
+            // entry is written — the directory precedes the payloads on
+            // disk, so a single forward pass can't know them yet.
+            let mut payloads = Vec::new();
+            let mut metas = Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                let start = payloads.len() as u64;
+                write_u32(&mut payloads, chunk.len() as u32);
+                let mut max_tf = 0u32;
+                for posting in *chunk {
+                    write_u32(&mut payloads, posting.doc_id);
+                    write_u32(&mut payloads, posting.positions.len() as u32);
+                    for &p in &posting.positions {
+                        write_u32(&mut payloads, p);
+                    }
+                    max_tf = max_tf.max(posting.positions.len() as u32);
                 }
+                metas.push(BlockMeta {
+                    last_doc_id: chunk.last().expect("chunks() never yields an empty slice").doc_id,
+                    max_tf,
+                    offset: start,
+                    length: (payloads.len() as u64 - start) as u32,
+                });
             }
+
+            for meta in &metas {
+                write_block_meta(&mut data, meta);
+            }
+            data.extend_from_slice(&payloads);
         }
     }
 
@@ -225,94 +291,143 @@ pub(crate) fn decode_post_header(bytes: &[u8]) -> Result<PostHeader> {
 
 const POST_BLOCK_WHAT: &str = "segment postings (term block)";
 
-fn term_block<'a>(bytes: &'a [u8], header: &PostHeader, term_id: u64) -> Result<&'a [u8]> {
-    let term_id = term_id as usize;
-    let start = *header
+/// Absolute byte offset, into `.post`, of term `term_id`'s block.
+fn term_block_start(header: &PostHeader, term_id: u64) -> Result<usize> {
+    header
         .offsets
-        .get(term_id)
-        .ok_or_else(|| Error::corruption(format!("{POST_BLOCK_WHAT}: term id out of range")))?
-        as usize;
-    let end = if term_id + 1 < header.offsets.len() {
-        header.offsets[term_id + 1] as usize
-    } else {
-        bytes.len()
-    };
+        .get(term_id as usize)
+        .map(|&o| o as usize)
+        .ok_or_else(|| Error::corruption(format!("{POST_BLOCK_WHAT}: term id out of range")))
+}
+
+fn term_block<'a>(bytes: &'a [u8], header: &PostHeader, term_id: u64) -> Result<&'a [u8]> {
+    let start = term_block_start(header, term_id)?;
+    let idx = term_id as usize;
+    let end =
+        if idx + 1 < header.offsets.len() { header.offsets[idx + 1] as usize } else { bytes.len() };
     bytes
         .get(start..end)
         .ok_or_else(|| Error::corruption(format!("{POST_BLOCK_WHAT}: offset table out of range")))
 }
 
-/// Decode exactly one term's postings (every field it occurs in), by the
-/// dense id `.terms`' FST maps it to. The only allocation this causes is for
-/// that one term's data — nothing else in the segment is touched.
-pub(crate) fn decode_term_postings(
-    bytes: &[u8],
-    header: &PostHeader,
-    term_id: u64,
-) -> Result<Vec<(FieldId, FieldPostings)>> {
-    let what = POST_BLOCK_WHAT;
-    let block = term_block(bytes, header, term_id)?;
-
-    let mut cur = Cursor::new(block, what);
-    let num_term_fields = cur.read_u32()? as usize;
-    let mut fields = Vec::with_capacity(num_term_fields);
-    for _ in 0..num_term_fields {
-        let field = cur.read_u32()? as FieldId;
-        let num_docs = cur.read_u32()? as usize;
-        let mut docs = Vec::with_capacity(num_docs);
-        for _ in 0..num_docs {
-            let doc_id = cur.read_u32()?;
-            let num_positions = cur.read_u32()? as usize;
-            let mut positions = Vec::with_capacity(num_positions);
-            for _ in 0..num_positions {
-                positions.push(cur.read_u32()?);
-            }
-            docs.push(DocPosting { doc_id, positions });
-        }
-        fields.push((field, FieldPostings { docs }));
-    }
-    Ok(fields)
+/// One (term, field)'s block directory: a doc-frequency count, read once, and
+/// every block's skip metadata — enough to decide which blocks are even
+/// worth decoding, without touching a single posting.
+pub(crate) struct TermFieldBlocks {
+    pub doc_freq: u32,
+    pub blocks: Vec<BlockMeta>,
 }
 
-/// Just the document ids one term occurs in, for one field — no positions
-/// decoded or allocated. `doc_freq`/`live_doc_freq` only ever need a count or
-/// a liveness check, never the positions, and autocomplete calls both across
-/// every candidate term and every source: decoding full posting lists
-/// (positions included) just to answer "how many" would mean paying for data
-/// nobody asked for on the hottest part of that path.
-pub(crate) fn decode_term_field_doc_ids(
+/// Decode one (term, field)'s block directory: `doc_freq` and every block's
+/// `BlockMeta`, with `BlockMeta.offset` already turned into an absolute
+/// offset into `bytes` (the same convention `decode_post_header` uses for its
+/// own top-level term table, one level up). `None` if the term never occurs
+/// in this field. The production entry point for the postings walk — no
+/// posting is decoded here, only the directory that says where they live.
+pub(crate) fn decode_term_field_blocks(
     bytes: &[u8],
     header: &PostHeader,
     term_id: u64,
     field: FieldId,
-) -> Result<Vec<DocId>> {
+) -> Result<Option<TermFieldBlocks>> {
     let what = POST_BLOCK_WHAT;
+    let term_start = term_block_start(header, term_id)?;
     let block = term_block(bytes, header, term_id)?;
 
     let mut cur = Cursor::new(block, what);
     let num_term_fields = cur.read_u32()? as usize;
     for _ in 0..num_term_fields {
         let this_field = cur.read_u32()? as FieldId;
-        let num_docs = cur.read_u32()? as usize;
+        let doc_freq = cur.read_u32()?;
+        let num_blocks = cur.read_u32()? as usize;
+
+        // Every block's metadata is fixed-width and read up front regardless
+        // of whether this is the field being asked about — for a field
+        // that isn't, `BlockMeta.length` is exactly what's needed to skip
+        // its payloads without decoding a single doc inside them.
+        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut payload_len: u64 = 0;
+        for _ in 0..num_blocks {
+            let meta = read_block_meta(&mut cur)?;
+            payload_len += meta.length as u64;
+            blocks.push(meta);
+        }
+
         if this_field != field {
-            // Skip every doc in a field nobody asked about, positions
-            // included — still no allocation, just cursor arithmetic.
-            for _ in 0..num_docs {
-                let _doc_id = cur.read_u32()?;
-                let num_positions = cur.read_u32()? as usize;
-                cur.skip(num_positions * 4)?;
-            }
+            cur.skip(payload_len as usize)?;
             continue;
         }
-        let mut doc_ids = Vec::with_capacity(num_docs);
-        for _ in 0..num_docs {
-            doc_ids.push(cur.read_u32()?);
-            let num_positions = cur.read_u32()? as usize;
-            cur.skip(num_positions * 4)?;
+
+        let payloads_start = (term_start + cur.position()) as u64;
+        for meta in &mut blocks {
+            meta.offset += payloads_start;
         }
-        return Ok(doc_ids);
+        return Ok(Some(TermFieldBlocks { doc_freq, blocks }));
     }
-    Ok(Vec::new())
+    Ok(None)
+}
+
+/// One block's per-doc skeleton — doc ids and term frequencies, decoded
+/// without materializing any positions. `positions_offset[i]` is the absolute
+/// byte offset (into the same `bytes` the block came from) of doc `i`'s
+/// positions, for a lazy read later via [`decode_positions_at`] — paid only
+/// when a document's positions are actually needed (phrase/proximity), never
+/// for a block skipped or only bound-checked.
+pub(crate) struct BlockSkeleton {
+    pub doc_ids: Vec<DocId>,
+    pub tfs: Vec<u32>,
+    pub positions_offsets: Vec<u64>,
+}
+
+pub(crate) fn decode_block_skeleton(bytes: &[u8], meta: &BlockMeta) -> Result<BlockSkeleton> {
+    let what = POST_BLOCK_WHAT;
+    let slice = bytes_at(bytes, meta.offset as usize, meta.length as usize, what)?;
+    let mut cur = Cursor::new(slice, what);
+    let num_docs = cur.read_u32()? as usize;
+    let mut doc_ids = Vec::with_capacity(num_docs);
+    let mut tfs = Vec::with_capacity(num_docs);
+    let mut positions_offsets = Vec::with_capacity(num_docs);
+    for _ in 0..num_docs {
+        doc_ids.push(cur.read_u32()?);
+        let num_positions = cur.read_u32()?;
+        tfs.push(num_positions);
+        positions_offsets.push(meta.offset + cur.position() as u64);
+        cur.skip(num_positions as usize * 4)?;
+    }
+    Ok(BlockSkeleton { doc_ids, tfs, positions_offsets })
+}
+
+/// One document's positions, decoded on demand from an offset
+/// [`decode_block_skeleton`] already located.
+pub(crate) fn decode_positions_at(bytes: &[u8], offset: u64, tf: u32) -> Result<Vec<u32>> {
+    let what = POST_BLOCK_WHAT;
+    let slice = bytes_at(bytes, offset as usize, tf as usize * 4, what)?;
+    let mut cur = Cursor::new(slice, what);
+    let mut positions = Vec::with_capacity(tf as usize);
+    for _ in 0..tf {
+        positions.push(cur.read_u32()?);
+    }
+    Ok(positions)
+}
+
+/// Just the document ids one term occurs in, for one field — no positions
+/// decoded or allocated. `live_doc_freq` needs every doc id (liveness varies
+/// per doc) but never the positions; `doc_freq` itself no longer walks
+/// anything, since [`TermFieldBlocks::doc_freq`] already has the count.
+pub(crate) fn decode_term_field_doc_ids(
+    bytes: &[u8],
+    header: &PostHeader,
+    term_id: u64,
+    field: FieldId,
+) -> Result<Vec<DocId>> {
+    let Some(term_field) = decode_term_field_blocks(bytes, header, term_id, field)? else {
+        return Ok(Vec::new());
+    };
+    let mut doc_ids = Vec::new();
+    for meta in &term_field.blocks {
+        doc_ids.extend(decode_block_skeleton(bytes, meta)?.doc_ids);
+    }
+    Ok(doc_ids)
 }
 
 // --- columns -----------------------------------------------------------
@@ -784,6 +899,8 @@ mod tests {
     use serde_json::json;
     use tachyon_core::{FieldSchema, FieldType, ParsedDocument};
 
+    use crate::inverted::FieldPostings;
+
     fn schema() -> CollectionSchema {
         CollectionSchema::new(
             "products",
@@ -817,6 +934,29 @@ mod tests {
         (m, schema)
     }
 
+    /// Walk every block of one (term, field) and materialize a full
+    /// [`FieldPostings`], positions included — the reference decode every
+    /// block-boundary test below checks the fast, lazy path against.
+    fn decode_term_field_full(
+        post_bytes: &[u8],
+        header: &PostHeader,
+        term_id: u64,
+        field: FieldId,
+    ) -> Option<FieldPostings> {
+        let term_field = decode_term_field_blocks(post_bytes, header, term_id, field).unwrap()?;
+        let mut docs = Vec::new();
+        for meta in &term_field.blocks {
+            let skeleton = decode_block_skeleton(post_bytes, meta).unwrap();
+            for i in 0..skeleton.doc_ids.len() {
+                let positions =
+                    decode_positions_at(post_bytes, skeleton.positions_offsets[i], skeleton.tfs[i])
+                        .unwrap();
+                docs.push(DocPosting { doc_id: skeleton.doc_ids[i], positions });
+            }
+        }
+        Some(FieldPostings { docs })
+    }
+
     fn term_postings(
         terms_bytes: &[u8],
         post_bytes: &[u8],
@@ -826,8 +966,7 @@ mod tests {
         let terms = validate_and_load_fst(terms_bytes, TERMS_MAGIC);
         let term_id = terms.get(term)?;
         let header = decode_post_header(post_bytes).unwrap();
-        let fields = decode_term_postings(post_bytes, &header, term_id).unwrap();
-        fields.into_iter().find(|(f, _)| *f == field).map(|(_, p)| p)
+        decode_term_field_full(post_bytes, &header, term_id, field)
     }
 
     /// Load an `fst::Map` straight from an in-memory encoded blob, skipping
@@ -893,11 +1032,8 @@ mod tests {
 
         for (term, field) in [("mouse", 0u16), ("blue", 1), ("pad", 0)] {
             let term_id = terms.get(term).unwrap();
-            let full = decode_term_postings(&encoded.post, &header, term_id).unwrap();
-            let expected: Vec<DocId> = full
-                .into_iter()
-                .find(|(f, _)| *f == field)
-                .map(|(_, p)| p.docs.iter().map(|d| d.doc_id).collect())
+            let expected: Vec<DocId> = decode_term_field_full(&encoded.post, &header, term_id, field)
+                .map(|p| p.docs.iter().map(|d| d.doc_id).collect())
                 .unwrap_or_default();
 
             let lean = decode_term_field_doc_ids(&encoded.post, &header, term_id, field).unwrap();
@@ -1071,5 +1207,102 @@ mod tests {
         found.sort();
         expected.sort();
         assert_eq!(found, expected);
+    }
+
+    // --- postings block layout ----------------------------------------
+
+    /// `n` documents, each a single-token "mouse" title at position 0 — every
+    /// document occupies exactly one posting, so `n` directly controls how
+    /// many blocks a term spans.
+    fn broad_fixture(n: usize) -> (MemTable, CollectionSchema) {
+        let schema = schema();
+        let mut m = MemTable::new(0, &schema);
+        for i in 0..n {
+            m.insert(doc(&i.to_string(), "mouse", &[], "Brand", i as i64));
+        }
+        (m, schema)
+    }
+
+    #[test]
+    fn a_term_spanning_exactly_n_blocks_has_no_partial_last_block() {
+        let (m, schema) = broad_fixture(POSTING_BLOCK_SIZE * 2);
+        let encoded = encode(&m, &schema).unwrap();
+        let terms = validate_and_load_fst(&encoded.terms, TERMS_MAGIC);
+        let header = decode_post_header(&encoded.post).unwrap();
+        let term_id = terms.get("mouse").unwrap();
+
+        let term_field = decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
+        assert_eq!(term_field.doc_freq, (POSTING_BLOCK_SIZE * 2) as u32);
+        assert_eq!(term_field.blocks.len(), 2, "256 docs at block size 128 is exactly two full blocks");
+        assert_eq!(term_field.blocks[0].last_doc_id, POSTING_BLOCK_SIZE as u32 - 1);
+        assert_eq!(term_field.blocks[1].last_doc_id, POSTING_BLOCK_SIZE as u32 * 2 - 1);
+
+        for meta in &term_field.blocks {
+            let skeleton = decode_block_skeleton(&encoded.post, meta).unwrap();
+            assert_eq!(skeleton.doc_ids.len(), POSTING_BLOCK_SIZE, "no partial last block");
+        }
+    }
+
+    #[test]
+    fn a_term_with_one_doc_past_a_block_boundary_gets_a_singleton_final_block() {
+        let (m, schema) = broad_fixture(POSTING_BLOCK_SIZE + 1);
+        let encoded = encode(&m, &schema).unwrap();
+        let terms = validate_and_load_fst(&encoded.terms, TERMS_MAGIC);
+        let header = decode_post_header(&encoded.post).unwrap();
+        let term_id = terms.get("mouse").unwrap();
+
+        let term_field = decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
+        assert_eq!(term_field.blocks.len(), 2);
+        let first = decode_block_skeleton(&encoded.post, &term_field.blocks[0]).unwrap();
+        let second = decode_block_skeleton(&encoded.post, &term_field.blocks[1]).unwrap();
+        assert_eq!(first.doc_ids.len(), POSTING_BLOCK_SIZE);
+        assert_eq!(second.doc_ids.len(), 1, "the 129th doc gets its own singleton final block");
+        assert_eq!(second.doc_ids[0], POSTING_BLOCK_SIZE as u32);
+        assert_eq!(term_field.blocks[1].last_doc_id, POSTING_BLOCK_SIZE as u32);
+    }
+
+    #[test]
+    fn decoding_across_a_block_boundary_matches_a_hand_built_expectation() {
+        let (m, schema) = broad_fixture(POSTING_BLOCK_SIZE * 2);
+        let encoded = encode(&m, &schema).unwrap();
+        let terms = validate_and_load_fst(&encoded.terms, TERMS_MAGIC);
+        let header = decode_post_header(&encoded.post).unwrap();
+        let term_id = terms.get("mouse").unwrap();
+        let term_field = decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
+
+        // The last doc of block 0 and the first doc of block 1 straddle the
+        // boundary — both must decode correctly from their own block.
+        let block0 = decode_block_skeleton(&encoded.post, &term_field.blocks[0]).unwrap();
+        let block1 = decode_block_skeleton(&encoded.post, &term_field.blocks[1]).unwrap();
+        let last_of_0 = block0.doc_ids.len() - 1;
+
+        assert_eq!(block0.doc_ids[last_of_0], POSTING_BLOCK_SIZE as u32 - 1);
+        assert_eq!(block1.doc_ids[0], POSTING_BLOCK_SIZE as u32);
+
+        let positions_last_of_0 = decode_positions_at(
+            &encoded.post,
+            block0.positions_offsets[last_of_0],
+            block0.tfs[last_of_0],
+        )
+        .unwrap();
+        let positions_first_of_1 =
+            decode_positions_at(&encoded.post, block1.positions_offsets[0], block1.tfs[0]).unwrap();
+        assert_eq!(positions_last_of_0, vec![0], "single-token title: \"mouse\" is always position 0");
+        assert_eq!(positions_first_of_1, vec![0]);
+    }
+
+    #[test]
+    fn skipping_a_field_nobody_asked_for_does_not_touch_its_postings() {
+        // "mouse" occurs in both title (field 0, broad) and, via the fixture
+        // below, nowhere else — this exercises the skip-by-BlockMeta-length
+        // path in `decode_term_field_blocks` for a field that isn't present
+        // at all, which must come back `None` rather than an error.
+        let (m, schema) = broad_fixture(POSTING_BLOCK_SIZE * 2);
+        let encoded = encode(&m, &schema).unwrap();
+        let terms = validate_and_load_fst(&encoded.terms, TERMS_MAGIC);
+        let header = decode_post_header(&encoded.post).unwrap();
+        let term_id = terms.get("mouse").unwrap();
+
+        assert!(decode_term_field_blocks(&encoded.post, &header, term_id, 1).unwrap().is_none());
     }
 }

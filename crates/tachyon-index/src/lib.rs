@@ -4,6 +4,7 @@
 //! index, and the columnar stores are layered on top of it.
 
 pub mod columns;
+mod cursor;
 pub mod fuzzy;
 pub mod inverted;
 pub mod memtable;
@@ -12,6 +13,7 @@ pub mod source;
 pub mod tokenizer;
 
 pub use columns::{Columns, KeywordColumn, NumKey, NumericColumn};
+pub use cursor::{MergeCursor, PostingCursor};
 pub use fuzzy::{distance_within, FuzzyMatcher};
 pub use inverted::{DocPosting, FieldPostings, InvertedIndex};
 pub use memtable::{MemTable, StoredDoc};

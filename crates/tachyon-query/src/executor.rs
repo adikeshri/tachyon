@@ -1,11 +1,25 @@
-//! Search execution: expand the query, walk the postings, score, take top-K.
+//! Search execution: expand the query, then hand the walk itself to
+//! `wand.rs`.
 //!
 //! # Shape of a search
 //!
 //! ```text
-//! q -> tokens -> per-token candidate terms -> postings walk
-//!   -> flat per-(document, field, token) accumulator -> composite score -> page
+//! q -> tokens -> per-token candidate terms -> wand::build_frontiers
+//!   -> wand::run_disjunctive / run_conjunctive -> page
 //! ```
+//!
+//! # Two pruning mechanisms, composed
+//!
+//! `wand.rs`'s drivers ("true WAND") decide which documents are worth
+//! resolving at all, skipping whole blocks — sometimes whole documents —
+//! when a sound bound proves they cannot affect the top-K; that's the only
+//! source of approximation (`SearchOutcome::found_is_exact`). A document
+//! that *is* resolved still passes through the older "scoped" mechanism
+//! inside `wand::DocScorer::score`: a real, exact per-field BM25 sum (not a
+//! bound — the document was already resolved) gates the expensive tail —
+//! proximity, the popularity read, `combine()` — the same way it always
+//! has. That mechanism never causes approximation; it only ever decides
+//! how much of an already-counted match's scoring to skip.
 //!
 //! # Multi-field scoring
 //!
@@ -15,76 +29,28 @@
 //! field" is chosen by boosted BM25, and that same field supplies the
 //! proximity and typo signals, so all five PRD §12 components describe the
 //! same match rather than a blend of unrelated ones.
-//!
-//! # Why the accumulator is flat
-//!
-//! A broad query on a large collection matches a large fraction of the corpus,
-//! and every match has to be scored. The obvious structure — a map from doc id
-//! to a struct holding a vector per field per token — allocates several times
-//! per matched document, and at a hundred thousand matches that allocation
-//! traffic dominates the query.
-//!
-//! So the evidence lives in flat vectors addressed arithmetically by
-//! `(slot, field, token)`. A newly matched document appends one block; nothing
-//! else allocates.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 use roaring::RoaringBitmap;
 
 use tachyon_core::{CollectionSchema, DocId, FieldId, Value};
-use tachyon_index::{FieldPostings, FuzzyMatcher, IndexSource};
+use tachyon_index::{FuzzyMatcher, IndexSource};
 
-use crate::bm25::{self, FieldStats};
+use crate::bm25::FieldStats;
 use crate::filter;
-use crate::query_text::{self, ParsedQuery};
+use crate::query_text;
 use crate::request::{MatchMode, SearchRequest};
-use crate::score::{self, ScoreComponents, ScoreWeights};
+use crate::score::ScoreComponents;
 use crate::sort::{self, SortClause, SortKey, SortValue};
+use crate::wand;
 
 /// Cap on how many dictionary terms one query token may expand into. Without
 /// it, a one-character prefix on a large collection would walk the entire term
 /// dictionary.
 pub const MAX_TERM_EXPANSIONS: usize = 128;
-
-/// Sentinel in the edits array meaning "this token did not match here".
-const UNMATCHED: u32 = u32::MAX;
-
-/// Hasher for the document accumulator's index.
-///
-/// The standard library's default is SipHash, which is the right choice for a
-/// map whose keys an attacker chooses — and the wrong one here. These keys are
-/// internal doc ids we assigned ourselves, sequential and dense, and a broad
-/// query hashes one per match.
-#[derive(Default, Clone, Copy)]
-struct DocIdHasher(u64);
-
-impl std::hash::Hasher for DocIdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        // Only ever called with a doc id, but stay correct if that changes.
-        for byte in bytes {
-            self.write_u64(*byte as u64);
-        }
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        // Fibonacci hashing: multiply by 2^64 / φ and fold the high bits, which
-        // mix in every input bit, down to where the map reads them.
-        self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        self.0 ^= self.0 >> 32;
-    }
-}
-
-type DocIdBuildHasher = std::hash::BuildHasherDefault<DocIdHasher>;
 
 /// Everything a search reads.
 pub struct SearchContext<'a> {
@@ -107,7 +73,7 @@ impl<'a> SearchContext<'a> {
     /// Corpus statistics for a field, summed across every source. BM25 needs
     /// global numbers; per-source stats would score the same document
     /// differently depending on which segment it landed in.
-    fn field_stats(&self, field: FieldId) -> FieldStats {
+    pub(crate) fn field_stats(&self, field: FieldId) -> FieldStats {
         let mut doc_count = 0u32;
         let mut total_len = 0u64;
         for source in &self.sources {
@@ -117,10 +83,40 @@ impl<'a> SearchContext<'a> {
         FieldStats::new(doc_count, total_len)
     }
 
-    fn value(&self, doc_id: DocId, field: FieldId) -> Option<Cow<'a, Value>> {
+    /// A document's declared *range* (`min_doc_id()..end_doc_id()`) can be
+    /// claimed by more than one source at once: a memtable that reserved a
+    /// range a later merge went on to claim (see `MemTable::reserve`) still
+    /// reports that span as its own, even though nothing is ever live there.
+    /// So a range match alone never stops the search below — every method
+    /// here tries each range-matching source in turn and falls through
+    /// whenever one turns out not to actually hold `doc_id` live, rather
+    /// than trusting the first (possibly hole-only) match.
+    pub(crate) fn value(&self, doc_id: DocId, field: FieldId) -> Option<Cow<'a, Value>> {
         self.sources.iter().find_map(|s| {
             (doc_id >= s.min_doc_id() && doc_id < s.end_doc_id()).then(|| s.value(doc_id, field))?
         })
+    }
+
+    /// The owning source's own `field_len`, or `0` if no source actually
+    /// holds this doc id live. See `Self::value`'s doc comment for why a
+    /// range match alone isn't enough to stop the search.
+    pub(crate) fn field_len(&self, doc_id: DocId, field: FieldId) -> u32 {
+        self.sources
+            .iter()
+            .find(|s| doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id))
+            .map_or(0, |s| s.field_len(doc_id, field))
+    }
+
+    /// Whether `doc_id` is live in whichever source actually holds it, and
+    /// not collection-wide tombstoned. Centralizes the liveness/tombstone
+    /// check the old per-posting walk repeated once per source per token;
+    /// here it runs once per document actually reached by a driver. See
+    /// `Self::value`'s doc comment for why a range match alone isn't enough.
+    pub(crate) fn is_live(&self, doc_id: DocId) -> bool {
+        self.sources
+            .iter()
+            .any(|s| doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id))
+            && !self.deleted.contains(doc_id)
     }
 }
 
@@ -144,133 +140,26 @@ pub struct ScoredDoc {
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     /// Total matching documents, not just the returned page (PRD §13 `found`).
+    /// A lower bound, not necessarily exact, whenever `found_is_exact` is
+    /// `false`.
     pub found: usize,
     pub hits: Vec<ScoredDoc>,
     /// Every document that matched, for faceting over the full result set
     /// rather than the page (PRD §7.7: "accurate counts after filters").
+    /// Same approximation caveat as `found` — facets read this bitmap
+    /// directly, so they inherit it automatically.
     pub matched: RoaringBitmap,
-}
-
-/// Per-(document, field, token) evidence, in flat arrays.
-///
-/// `slot` identifies a matched document; `field` is an index into the
-/// request's `query_by` list, not a schema field id.
-struct Accumulator {
-    num_fields: usize,
-    num_tokens: usize,
-    /// Doc id to slot.
-    index: std::collections::HashMap<DocId, u32, DocIdBuildHasher>,
-    /// Slot to doc id.
-    docs: Vec<DocId>,
-    /// Best BM25 contribution, addressed by [`Accumulator::cell`].
-    scores: Vec<f32>,
-    /// Cheapest edit distance, same addressing. [`UNMATCHED`] if absent.
-    edits: Vec<u32>,
-    /// Token positions, same addressing. Empty unless positions are needed.
-    positions: Vec<Vec<u32>>,
-    needs_positions: bool,
-}
-
-impl Accumulator {
-    fn new(num_fields: usize, num_tokens: usize, needs_positions: bool) -> Accumulator {
-        Accumulator {
-            num_fields: num_fields.max(1),
-            num_tokens: num_tokens.max(1),
-            index: std::collections::HashMap::default(),
-            docs: Vec::new(),
-            scores: Vec::new(),
-            edits: Vec::new(),
-            positions: Vec::new(),
-            needs_positions,
-        }
-    }
-
-    /// Slot for a document, appending a fresh block the first time it is seen.
-    ///
-    /// One hash lookup, not the two a `get` followed by an `insert` would cost:
-    /// this runs once per posting on a broad query, which is the single most
-    /// executed line in a search.
-    fn slot(&mut self, doc_id: DocId) -> usize {
-        let next = self.docs.len() as u32;
-        match self.index.entry(doc_id) {
-            std::collections::hash_map::Entry::Occupied(existing) => *existing.get() as usize,
-            std::collections::hash_map::Entry::Vacant(empty) => {
-                empty.insert(next);
-                self.docs.push(doc_id);
-
-                let block = self.num_fields * self.num_tokens;
-                self.scores.resize(self.scores.len() + block, 0.0);
-                self.edits.resize(self.edits.len() + block, UNMATCHED);
-                if self.needs_positions {
-                    self.positions.resize(self.positions.len() + block, Vec::new());
-                }
-                next as usize
-            }
-        }
-    }
-
-    /// Put every position list into the sorted, deduplicated form the phrase
-    /// and proximity checks need.
-    ///
-    /// Done once, after the walk, rather than on each read: a position list is
-    /// read once per field per phrase token and again for proximity, and
-    /// sorting a fresh clone every time was the largest cost in scoring a
-    /// multi-token query. Positions arrive out of order because one token can
-    /// expand into several terms, each contributing its own occurrences.
-    fn normalize_positions(&mut self) {
-        for list in &mut self.positions {
-            if list.len() > 1 {
-                list.sort_unstable();
-                list.dedup();
-            }
-        }
-    }
-
-    fn cell(&self, slot: usize, field: usize, token: usize) -> usize {
-        (slot * self.num_fields + field) * self.num_tokens + token
-    }
-
-    /// Whether the token matched in this field of this document.
-    fn matched(&self, slot: usize, field: usize, token: usize) -> bool {
-        self.edits[self.cell(slot, field, token)] != UNMATCHED
-    }
-
-    /// BM25 for one field of one document: the sum over its matched tokens.
-    fn field_bm25(&self, slot: usize, field: usize) -> f32 {
-        let start = self.cell(slot, field, 0);
-        self.scores[start..start + self.num_tokens].iter().sum()
-    }
-
-    fn field_edits(&self, slot: usize, field: usize) -> u32 {
-        let start = self.cell(slot, field, 0);
-        self.edits[start..start + self.num_tokens].iter().filter(|e| **e != UNMATCHED).sum()
-    }
-
-    fn field_matched_tokens(&self, slot: usize, field: usize) -> usize {
-        let start = self.cell(slot, field, 0);
-        self.edits[start..start + self.num_tokens].iter().filter(|e| **e != UNMATCHED).count()
-    }
-
-    /// Sorted, deduplicated positions of one token in one field.
-    ///
-    /// Valid only after [`Accumulator::normalize_positions`]; borrowed rather
-    /// than cloned, so reading a position list costs nothing.
-    fn token_positions(&self, slot: usize, field: usize, token: usize) -> &[u32] {
-        if !self.needs_positions {
-            return &[];
-        }
-        &self.positions[self.cell(slot, field, token)]
-    }
-
-    fn len(&self) -> usize {
-        self.docs.len()
-    }
+    /// `false` iff pruning skipped at least one block of at least one
+    /// term's postings while answering this query. See `wand.rs`'s module
+    /// doc for exactly which mechanism this tracks (only the block-level
+    /// one; the older scoped mechanism never causes approximation).
+    pub found_is_exact: bool,
 }
 
 /// Run a search.
 ///
-/// Filters are evaluated first, into a bitmap, so the postings walk can reject
-/// a document before scoring it rather than after.
+/// Filters are evaluated first, into a bitmap, so the pruning walk can
+/// reject a document before ever resolving it.
 pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
     let filter_set = req.filter_expr.as_ref().map(|expr| filter::evaluate(expr, &ctx.sources));
     let filter = filter_set.as_ref();
@@ -298,211 +187,119 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
 
     // Positions are read only by proximity scoring and phrase verification. A
     // single-token query needs neither — the proximity of one term is 1.0 by
-    // definition — and collecting them anyway is the largest avoidable cost on
+    // definition — and decoding them anyway is the largest avoidable cost on
     // a query that matches a lot of documents.
     let needs_positions = tokens.len() > 1 || !query.phrases.is_empty();
-    let mut acc = Accumulator::new(req.query_by.len(), tokens.len(), needs_positions);
-
-    // Reused across candidates so the outer `Vec` does not reallocate per
-    // candidate. The `Cow` each slot holds is a zero-cost borrow for a
-    // memtable source but a fresh decode for a segment one — resolving a
-    // term against every source once, rather than once for `doc_freq` and
-    // again for the postings walk, still matters for a segment exactly
-    // because that decode is real work now.
-    let mut per_source: Vec<Option<Cow<'_, FieldPostings>>> = Vec::with_capacity(ctx.sources.len());
-
-    for (field_pos, &(field, _boost)) in req.query_by.iter().enumerate() {
-        let stats = ctx.field_stats(field);
-        if stats.doc_count == 0 {
-            continue;
-        }
-
-        for (token_idx, candidates) in expansions.iter().enumerate() {
-            for candidate in candidates {
-                // Resolve the term in each source once. Asking for the document
-                // frequency and then for the postings would walk every source's
-                // term dictionary twice for the same term.
-                per_source.clear();
-                per_source.extend(ctx.sources.iter().map(|s| s.postings(&candidate.term, field)));
-
-                let doc_freq: u32 =
-                    per_source.iter().map(|p| p.as_ref().map_or(0, |p| p.doc_freq())).sum();
-                if doc_freq == 0 {
-                    continue;
-                }
-                let idf = bm25::idf(doc_freq, stats.doc_count);
-
-                for (source, postings) in ctx.sources.iter().zip(per_source.iter()) {
-                    let Some(postings) = postings else {
-                        continue;
-                    };
-                    for posting in &postings.docs {
-                        let doc_id = posting.doc_id;
-                        if !source.is_live(doc_id) || ctx.deleted.contains(doc_id) {
-                            continue;
-                        }
-                        if filter.is_some_and(|f| !f.contains(doc_id)) {
-                            continue;
-                        }
-
-                        let field_len = source.field_len(doc_id, field);
-                        let contribution = bm25::term_score(posting.tf(), field_len, stats, idf);
-
-                        let slot = acc.slot(doc_id);
-                        let cell = acc.cell(slot, field_pos, token_idx);
-
-                        // A token expanded into several terms keeps its best
-                        // single contribution rather than the sum, so matching
-                        // many prefix variants is not itself a relevance signal.
-                        if contribution > acc.scores[cell] {
-                            acc.scores[cell] = contribution;
-                        }
-                        if candidate.edits < acc.edits[cell] {
-                            acc.edits[cell] = candidate.edits;
-                        }
-                        if needs_positions {
-                            acc.positions[cell].extend_from_slice(&posting.positions);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    acc.normalize_positions();
-    finish(ctx, req, &query, acc)
-}
-
-/// Turn the accumulator into a ranked page.
-fn finish(
-    ctx: &SearchContext,
-    req: &SearchRequest,
-    query: &ParsedQuery,
-    acc: Accumulator,
-) -> SearchOutcome {
-    let tokens = &query.tokens;
-    let weights = ScoreWeights::default();
-    let max_boost = score::max_boost(ctx.schema);
     let allowed_edits = total_allowed_edits(ctx.schema, tokens, req);
-    let popularity_field = ctx.schema.field(score::POPULARITY_FIELD).map(|(id, _)| id);
 
-    let required = match req.match_mode {
-        MatchMode::All => tokens.len(),
-        MatchMode::Any => 1,
+    // Same eligibility rule the scoped mechanism has always used: only sound
+    // when relevance score decides the *primary* order. A field-only sort
+    // could still need a low-relevance document, so pruning is skipped
+    // entirely and both drivers degrade to a plain, exact merge/leapfrog —
+    // see `wand.rs` §7.3 in the design notes for why this falls out of the
+    // algorithm itself rather than needing a separate code path.
+    let prunable = req
+        .sort_clauses
+        .as_ref()
+        .is_none_or(|clauses| clauses.first().is_some_and(|c| c.key == SortKey::TextMatch));
+
+    let mut frontiers = wand::build_frontiers(ctx, req, &expansions);
+    let scorer = wand::DocScorer::new(ctx, req, filter, allowed_edits, needs_positions, tokens.len());
+    let mut top_k = prunable.then(|| TopKByScore::new(req.window()));
+    let mut candidates: Vec<Ranked> = Vec::new(); // used only when `top_k` is None
+
+    let (matched_ids, any_skip) = match req.match_mode {
+        MatchMode::Any => {
+            wand::run_disjunctive(&mut frontiers, &query, &scorer, &mut top_k, &mut candidates)
+        }
+        MatchMode::All => {
+            wand::run_conjunctive(&mut frontiers, &query, &scorer, &mut top_k, &mut candidates)
+        }
     };
 
-    let num_fields = req.query_by.len();
-    let mut candidates: Vec<Ranked> = Vec::new();
-    // Gathered flat and turned into a bitmap at the end. Documents are visited
-    // in postings-walk order, which is not doc id order, and inserting an
-    // unordered run into a roaring bitmap shifts elements inside its container
-    // on nearly every call — a real cost when a broad query matches thousands
-    // of documents, and this set is built on every search that facets.
-    let mut matched_ids: Vec<DocId> = Vec::new();
-    // Reused across documents so scoring allocates once, not once per hit.
-    let mut present: Vec<&[u32]> = Vec::with_capacity(tokens.len());
-
-    for slot in 0..acc.len() {
-        let doc_id = acc.docs[slot];
-
-        // A document qualifies on the union of its fields: "wireless" in the
-        // title and "mouse" in the description is still a match for
-        // "wireless mouse".
-        let union = (0..tokens.len())
-            .filter(|token| (0..num_fields).any(|f| acc.matched(slot, f, *token)))
-            .count();
-        if union < required {
-            continue;
-        }
-
-        // A phrase is all-or-nothing regardless of match mode: quoting terms
-        // is an explicit request for them to be adjacent.
-        if !query.phrases.is_empty() && !satisfies_phrases(&acc, slot, req, &query.phrases) {
-            continue;
-        }
-
-        matched_ids.push(doc_id);
-
-        // Pick the field that best explains this match.
-        let mut best_field = 0usize;
-        let mut best_bm25 = 0.0f32;
-        let mut best_boosted = f32::NEG_INFINITY;
-        for field_pos in 0..num_fields {
-            let raw = acc.field_bm25(slot, field_pos);
-            let boosted = raw * req.query_by[field_pos].1;
-            if boosted > best_boosted {
-                best_boosted = boosted;
-                best_bm25 = raw;
-                best_field = field_pos;
-            }
-        }
-
-        // Proximity is only meaningful over the tokens this field actually has.
-        present.clear();
-        present.extend(
-            (0..tokens.len())
-                .filter(|token| acc.matched(slot, best_field, *token))
-                .map(|token| acc.token_positions(slot, best_field, token)),
-        );
-
-        let matched_here = acc.field_matched_tokens(slot, best_field);
-        let proximity = if matched_here == tokens.len() {
-            score::proximity(&present)
-        } else {
-            // A partial match in this field cannot claim tight proximity.
-            score::proximity(&present) * matched_here as f32 / tokens.len() as f32
-        };
-
-        let popularity = popularity_field
-            .and_then(|f| ctx.value(doc_id, f))
-            .and_then(|v| v.as_f64())
-            .map(|v| score::normalize_popularity(v as f32))
-            .unwrap_or(0.0);
-
-        let components = ScoreComponents {
-            bm25: score::normalize_bm25(best_bm25),
-            field_boost: score::normalize_field_boost(req.query_by[best_field].1, max_boost),
-            proximity,
-            typo_penalty: score::typo_penalty(acc.field_edits(slot, best_field), allowed_edits),
-            popularity,
-        };
-
-        let score = components.combine(&weights);
-        candidates.push(Ranked {
-            doc_id,
-            score,
-            components,
-            sort_values: sort_values(ctx, req, doc_id, score),
-        });
-    }
-
-    // A document reaches this point at most once, so the count is exact and no
-    // deduplication is needed.
+    // Both drivers visit doc ids in strictly ascending order (`MergeCursor`
+    // merges across sources in doc-id order, and a driver only ever visits
+    // a doc id once), so this is a direct build, not a sort-then-dedup.
     let found = matched_ids.len();
-    let matched = sorted_bitmap(matched_ids);
+    let matched = RoaringBitmap::from_sorted_iter(matched_ids)
+        .expect("both drivers visit docs in ascending order");
 
+    let candidates = top_k.map_or(candidates, TopKByScore::into_vec);
     let hits = paginate(req, candidates);
-    SearchOutcome { found, hits, matched }
+    SearchOutcome { found, hits, matched, found_is_exact: !any_skip }
 }
 
-/// Build a bitmap from doc ids in arbitrary order, sorting first so the fill
-/// is linear rather than an insert-and-shift per element.
-///
-/// Worth it because a result set is sparse: roaring holds it in array
-/// containers, where an out-of-order insert shifts the tail of the container.
-/// The same trick loses on a dense set — see `collect_docs` in the index
-/// crate's columns, which deliberately does not sort.
-fn sorted_bitmap(mut doc_ids: Vec<DocId>) -> RoaringBitmap {
-    if doc_ids.is_empty() {
-        return RoaringBitmap::new();
+/// Bounds how many fully-scored candidates `finish` carries forward, so a
+/// broad query does not carry every match through proximity/popularity
+/// scoring only to discard most of them in `paginate`. A max-heap ordered so
+/// `peek`/`pop` return the *worst* of the currently-kept set — the one
+/// candidate for eviction, and the threshold a new candidate's bound must
+/// clear to be worth fully scoring.
+pub(crate) struct TopKByScore {
+    window: usize,
+    heap: BinaryHeap<ScoredEntry>,
+}
+
+struct ScoredEntry(Ranked);
+
+impl PartialEq for ScoredEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.score == other.0.score && self.0.doc_id == other.0.doc_id
     }
-    doc_ids.sort_unstable();
-    doc_ids.dedup();
-    RoaringBitmap::from_sorted_iter(doc_ids).expect("doc ids were sorted and deduplicated")
+}
+impl Eq for ScoredEntry {}
+impl PartialOrd for ScoredEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScoredEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reversed against the real ranking (lower score / higher doc id
+        // first): a `BinaryHeap` is a max-heap, and `peek`/`pop` should
+        // surface the *worst* kept candidate, not the best.
+        other.0.score.total_cmp(&self.0.score).then(other.0.doc_id.cmp(&self.0.doc_id))
+    }
+}
+
+impl TopKByScore {
+    pub(crate) fn new(window: usize) -> TopKByScore {
+        TopKByScore { window, heap: BinaryHeap::with_capacity(window.min(1024)) }
+    }
+
+    /// The score a new candidate's bound must meet or beat to be worth fully
+    /// scoring. `None` while there's still room in the kept set — nothing to
+    /// prune against yet.
+    pub(crate) fn threshold(&self) -> Option<f32> {
+        if self.heap.len() < self.window {
+            None
+        } else {
+            self.heap.peek().map(|worst| worst.0.score)
+        }
+    }
+
+    pub(crate) fn push(&mut self, ranked: Ranked) {
+        if self.heap.len() < self.window {
+            self.heap.push(ScoredEntry(ranked));
+            return;
+        }
+        let Some(worst) = self.heap.peek() else { return };
+        let replaces =
+            ranked.score > worst.0.score || (ranked.score == worst.0.score && ranked.doc_id < worst.0.doc_id);
+        if replaces {
+            self.heap.pop();
+            self.heap.push(ScoredEntry(ranked));
+        }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<Ranked> {
+        self.heap.into_iter().map(|entry| entry.0).collect()
+    }
 }
 
 /// An empty query matches every live document, so filters and sorting can be
-/// used on their own to browse a collection.
+/// used on their own to browse a collection. No relevance signal to bound
+/// here — score is hardcoded `0.0` — so this never approximates.
 fn match_all(
     ctx: &SearchContext,
     req: &SearchRequest,
@@ -531,12 +328,12 @@ fn match_all(
 
     let found = matched.len() as usize;
     let hits = paginate(req, candidates);
-    SearchOutcome { found, hits, matched }
+    SearchOutcome { found, hits, matched, found_is_exact: true }
 }
 
 /// Values for each sort clause, in clause order. Empty when the request does
 /// not sort, in which case ranking falls back to score.
-fn sort_values(
+pub(crate) fn sort_values(
     ctx: &SearchContext,
     req: &SearchRequest,
     doc_id: DocId,
@@ -590,40 +387,6 @@ fn paginate(req: &SearchRequest, mut candidates: Vec<Ranked>) -> Vec<ScoredDoc> 
         .take(req.limit)
         .map(|r| ScoredDoc { doc_id: r.doc_id, score: r.score, components: r.components })
         .collect()
-}
-
-/// Whether some single field places every phrase's tokens consecutively.
-///
-/// A phrase must be satisfied within one field — `title` ending in "mouse" and
-/// `description` starting with "pad" is not the phrase "mouse pad".
-fn satisfies_phrases(
-    acc: &Accumulator,
-    slot: usize,
-    req: &SearchRequest,
-    phrases: &[(usize, usize)],
-) -> bool {
-    phrases.iter().all(|&(start, end)| {
-        (0..req.query_by.len()).any(|field| phrase_in_field(acc, slot, field, start, end))
-    })
-}
-
-fn phrase_in_field(acc: &Accumulator, slot: usize, field: usize, start: usize, end: usize) -> bool {
-    // Every token of the phrase has to be present in this field at all.
-    if (start..=end).any(|token| !acc.matched(slot, field, token)) {
-        return false;
-    }
-
-    // Walk the first token's positions; each is a candidate phrase start.
-    let first = acc.token_positions(slot, field, start);
-
-    first.iter().any(|&anchor| {
-        (start + 1..=end).enumerate().all(|(offset, token)| {
-            let positions = acc.token_positions(slot, field, token);
-            anchor
-                .checked_add(offset as u32 + 1)
-                .is_some_and(|expected| positions.binary_search(&expected).is_ok())
-        })
-    })
 }
 
 /// Total edit budget the typo table grants this query, used to normalize the
@@ -708,12 +471,12 @@ fn expand_token(
 
 /// A candidate document with everything needed to order it.
 #[derive(Debug, Clone)]
-struct Ranked {
-    doc_id: DocId,
-    score: f32,
-    components: ScoreComponents,
+pub(crate) struct Ranked {
+    pub(crate) doc_id: DocId,
+    pub(crate) score: f32,
+    pub(crate) components: ScoreComponents,
     /// One entry per sort clause; empty when ranking by relevance.
-    sort_values: Vec<SortValue>,
+    pub(crate) sort_values: Vec<SortValue>,
 }
 
 #[cfg(test)]
@@ -732,6 +495,11 @@ mod tests {
                 FieldSchema::new("title", FieldType::Text),
                 FieldSchema::new("description", FieldType::Text),
                 FieldSchema::new("popularity", FieldType::Int).with_sort(true),
+                // A second sortable field, independent of relevance — unlike
+                // `popularity`, which is also a scoring signal (`combine()`'s
+                // 5% component), so it can't double as a tie-break that's
+                // independent of the thing it's supposedly tying on.
+                FieldSchema::new("price", FieldType::Int).with_sort(true),
             ],
         )
     }
@@ -1301,5 +1069,621 @@ mod tests {
         let out =
             f.search(SearchParams { query_by: Some("description".into()), ..query("comfortable") });
         assert_eq!(f.ids(&out), vec!["1"]);
+    }
+
+    // --- score-bound pruning (scoped block-max WAND) -----------------------
+
+    /// Every document matches "mouse", with relevance varying by how many
+    /// times it repeats in the title — enough documents, with enough score
+    /// variation, that a small `limit` genuinely exercises pruning rather
+    /// than the top-k set just happening to equal every match.
+    fn broad_corpus(n: usize) -> Fixture {
+        let docs: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let repeats = (i % 5) + 1;
+                let title = vec!["mouse"; repeats].join(" ");
+                json!({
+                    "id": i.to_string(),
+                    "title": title,
+                    "description": "a mouse for the desk",
+                    "popularity": (i * 37 % 1000) as i64,
+                })
+            })
+            .collect();
+        Fixture::new(&docs)
+    }
+
+    #[test]
+    fn pruning_returns_the_identical_top_k_as_exhaustive_scoring() {
+        let f = broad_corpus(40);
+        let small = f.search(SearchParams { limit: Some(5), ..query("mouse") });
+        let large = f.search(SearchParams { limit: Some(40), ..query("mouse") });
+
+        assert_eq!(small.found, 40);
+        assert_eq!(small.found, large.found);
+
+        let small_ids: Vec<DocId> = small.hits.iter().map(|h| h.doc_id).collect();
+        let large_first_5: Vec<DocId> = large.hits.iter().take(5).map(|h| h.doc_id).collect();
+        assert_eq!(small_ids, large_first_5, "pruning must not change which docs win the page");
+
+        let small_scores: Vec<f32> = small.hits.iter().map(|h| h.score).collect();
+        let large_scores: Vec<f32> = large.hits.iter().take(5).map(|h| h.score).collect();
+        assert_eq!(small_scores, large_scores, "and not their exact scores either");
+    }
+
+    #[test]
+    fn pruning_does_not_change_the_matched_set() {
+        // facets::compute reads this bitmap directly — it must be identical
+        // regardless of how aggressively scoring was pruned to build the page.
+        let f = broad_corpus(40);
+        let small = f.search(SearchParams { limit: Some(5), ..query("mouse") });
+        let large = f.search(SearchParams { limit: Some(40), ..query("mouse") });
+        assert_eq!(small.matched, large.matched);
+    }
+
+    #[test]
+    fn pruning_is_bypassed_for_a_field_only_sort() {
+        // "winner" barely matches (weak relevance) but has the lowest
+        // popularity; every filler has much stronger relevance. Under
+        // sort=popularity:asc, "winner" must still win — which is only true
+        // if a field-only sort disables score-bound pruning entirely.
+        let mut docs = vec![json!({
+            "id": "winner", "title": "desk accessory", "description": "a mouse pad, barely",
+            "popularity": 0,
+        })];
+        for i in 0..30 {
+            docs.push(json!({
+                "id": format!("filler{i}"),
+                "title": "mouse mouse mouse mouse mouse",
+                "description": "mouse mouse mouse",
+                "popularity": 100 + i,
+            }));
+        }
+        let f = Fixture::new(&docs);
+        let out = f.search(SearchParams {
+            sort: Some("popularity:asc".into()),
+            limit: Some(3),
+            match_mode: Some("any".into()),
+            ..query("mouse")
+        });
+        assert_eq!(
+            f.ids(&out)[0],
+            "winner",
+            "the lowest-popularity doc must win regardless of its weak relevance"
+        );
+    }
+
+    #[test]
+    fn pruning_stays_sound_with_a_secondary_sort_clause() {
+        // Two documents tie exactly on relevance — identical title *and*
+        // popularity, since popularity is itself part of combine()'s score,
+        // not just a sort key — differing only in `price`.
+        // sort=_text_match:desc,price:asc must still order them correctly,
+        // and both must survive pruning to even be compared, proving a
+        // TextMatch-primary sort keeps pruning valid.
+        //
+        // Popularity is held constant across the whole corpus so it can't
+        // confound relevance, and a block of non-matching documents keeps
+        // "mouse"'s document frequency well under the corpus size — with
+        // *every* document matching, idf collapses toward zero and the tiny
+        // 5%-weighted popularity term would dominate instead of BM25,
+        // which is the opposite of what this test needs to isolate.
+        let mut docs = vec![
+            json!({"id": "tie_high_price", "title": "mouse mouse mouse", "description": "d", "popularity": 50, "price": 500}),
+            json!({"id": "tie_low_price", "title": "mouse mouse mouse", "description": "d", "popularity": 50, "price": 10}),
+        ];
+        for i in 0..30 {
+            docs.push(json!({
+                "id": format!("filler{i}"),
+                "title": "mouse", "description": "d",
+                "popularity": 50,
+                "price": (i * 7 % 1000) as i64,
+            }));
+        }
+        for i in 0..50 {
+            docs.push(json!({
+                "id": format!("noise{i}"),
+                "title": "keyboard", "description": "d",
+                "popularity": 50,
+                "price": (i * 11 % 1000) as i64,
+            }));
+        }
+        let f = Fixture::new(&docs);
+        let out = f.search(SearchParams {
+            sort: Some("_text_match:desc,price:asc".into()),
+            limit: Some(3),
+            match_mode: Some("any".into()),
+            ..query("mouse")
+        });
+        let ids = f.ids(&out);
+        assert_eq!(
+            ids,
+            vec!["tie_low_price", "tie_high_price", "filler0"],
+            "the tf=3 docs must clearly outrank every tf=1 filler, then order by price on their tie"
+        );
+    }
+
+    #[test]
+    fn pruning_is_correct_beyond_the_first_page() {
+        let f = broad_corpus(40);
+        let page1 = f.search(SearchParams { limit: Some(5), offset: Some(0), ..query("mouse") });
+        let page2 = f.search(SearchParams { limit: Some(5), offset: Some(5), ..query("mouse") });
+        let exhaustive = f.search(SearchParams { limit: Some(40), ..query("mouse") });
+
+        let combined: Vec<DocId> =
+            page1.hits.iter().chain(page2.hits.iter()).map(|h| h.doc_id).collect();
+        let expected: Vec<DocId> = exhaustive.hits.iter().take(10).map(|h| h.doc_id).collect();
+        assert_eq!(combined, expected, "window = offset + limit must size the kept set correctly");
+    }
+
+    #[test]
+    fn limit_zero_still_reports_found_and_matched_without_scoring() {
+        let f = broad_corpus(10);
+        let out = f.search(SearchParams { limit: Some(0), ..query("mouse") });
+        assert!(out.hits.is_empty());
+        assert_eq!(out.found, 10);
+        assert_eq!(out.matched.len(), 10);
+    }
+
+    // --- true block-max WAND (wand.rs) --------------------------------------
+
+    /// A corpus flushed to a real on-disk segment, for tests that need
+    /// genuine block structure (`POSTING_BLOCK_SIZE = 128` postings per
+    /// block) — a memtable alone has none, so a test that must exercise
+    /// `SegmentPostingCursor`'s block-jump path needs a real segment.
+    struct SegmentFixture {
+        _dir: tempfile::TempDir,
+        schema: CollectionSchema,
+        reader: tachyon_index::SegmentReader,
+    }
+
+    impl SegmentFixture {
+        fn new(docs: &[serde_json::Value]) -> SegmentFixture {
+            let schema = schema();
+            let mut m = MemTable::new(0, &schema);
+            for doc in docs {
+                m.insert(ParsedDocument::parse(doc.clone(), &schema).unwrap());
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let encoded = tachyon_index::encode(&m, &schema).unwrap();
+            let paths = tachyon_index::SegmentFilePaths {
+                terms: dir.path().join("seg.terms"),
+                ids: dir.path().join("seg.ids"),
+                post: dir.path().join("seg.post"),
+                col: dir.path().join("seg.col"),
+                doc: dir.path().join("seg.doc"),
+            };
+            std::fs::write(&paths.terms, &encoded.terms).unwrap();
+            std::fs::write(&paths.ids, &encoded.ids).unwrap();
+            std::fs::write(&paths.post, &encoded.post).unwrap();
+            std::fs::write(&paths.col, &encoded.col).unwrap();
+            std::fs::write(&paths.doc, &encoded.doc).unwrap();
+            let reader = tachyon_index::SegmentReader::open(&paths, &schema).unwrap();
+            SegmentFixture { _dir: dir, schema, reader }
+        }
+
+        fn search(&self, params: SearchParams) -> SearchOutcome {
+            let req = SearchRequest::resolve(params, &self.schema).unwrap();
+            let deleted = RoaringBitmap::new();
+            let ctx = SearchContext::new(&self.schema, vec![&self.reader], &deleted);
+            execute(&ctx, &req)
+        }
+    }
+
+    /// A corpus engineered so a *block*-level bound can be proven, not just
+    /// hoped, to fall below an already-full top-K's threshold:
+    ///
+    /// - `block0_count` "kept" documents come first (the lowest doc ids, so
+    ///   they occupy the term's first posting block): term frequency
+    ///   `high_tf` and a high `popularity`. `popularity` matters because
+    ///   `bound_to_combined_score` always assumes the *best possible*
+    ///   popularity (1.0) — giving the real kept documents a genuinely high
+    ///   one too keeps that assumption from being free, unearned slack for
+    ///   every other block's bound to hide behind. BM25's own saturation
+    ///   (`K1 = 1.2`) caps how much a *single* token's real score can ever
+    ///   exceed a `tf = 1` bound (≈1.3x, however extreme `high_tf` gets, or
+    ///   however favorable the length normalization) — nowhere near enough
+    ///   on its own to clear a threshold that also credits a full
+    ///   popularity component.
+    /// - `filler_docs` documents that do NOT contain "mouse" at all, so
+    ///   "mouse"'s idf stays well above zero — an every-document-matches
+    ///   query collapses idf toward zero and makes any bound comparison
+    ///   meaningless (the same trap `pruning_stays_sound_with_a_secondary_
+    ///   sort_clause` above avoids). Long enough (20 tokens) to keep the
+    ///   corpus's average field length from being dominated by the tiny
+    ///   `tf = 1` tail, which is what keeps the *kept* documents' own
+    ///   length normalization close to its floor.
+    /// - `block1_count` "tail" documents, at the lowest possible term
+    ///   frequency (1) and no popularity, forming the term's second (and
+    ///   later) posting blocks.
+    fn skewed_block_corpus(
+        filler_docs: usize,
+        block0_count: usize,
+        high_tf: usize,
+        block1_count: usize,
+    ) -> Vec<serde_json::Value> {
+        let mut docs = Vec::new();
+        for i in 0..block0_count {
+            let title = vec!["mouse"; high_tf].join(" ");
+            docs.push(json!({"id": format!("k{i}"), "title": title, "description": "d", "popularity": 3000}));
+        }
+        for i in 0..filler_docs {
+            let title = (0..20).map(|w| format!("filler{w}")).collect::<Vec<_>>().join(" ");
+            docs.push(json!({"id": format!("f{i}"), "title": title, "description": "d"}));
+        }
+        for i in 0..block1_count {
+            docs.push(json!({"id": format!("t{i}"), "title": "mouse", "description": "d"}));
+        }
+        docs
+    }
+
+    /// Same cliff shape as [`skewed_block_corpus`], but with two tokens that
+    /// always co-occur at the same term frequency — for a two-token `All`
+    /// mode query whose intersection is the whole corpus, so a genuine
+    /// undercount can only come from the driver's own pruning, never from
+    /// the intersection legitimately excluding anything.
+    fn skewed_block_corpus_two_tokens(
+        filler_docs: usize,
+        block0_count: usize,
+        high_tf: usize,
+        block1_count: usize,
+    ) -> Vec<serde_json::Value> {
+        let mut docs = Vec::new();
+        for i in 0..block0_count {
+            let title = vec!["mouse pad"; high_tf].join(" ");
+            docs.push(json!({"id": format!("k{i}"), "title": title, "description": "d", "popularity": 3000}));
+        }
+        for i in 0..filler_docs {
+            let title = (0..20).map(|w| format!("filler{w}")).collect::<Vec<_>>().join(" ");
+            docs.push(json!({"id": format!("f{i}"), "title": title, "description": "d"}));
+        }
+        for i in 0..block1_count {
+            docs.push(json!({"id": format!("t{i}"), "title": "mouse pad", "description": "d"}));
+        }
+        docs
+    }
+
+    #[test]
+    fn soundness_under_a_full_window_in_both_match_modes() {
+        // A corpus spanning several blocks — a stronger soundness check than
+        // the single-block `pruning_returns_the_identical_top_k...` above —
+        // with `limit` == every match, so pruning never engages in either
+        // driver and `found_is_exact` must come back `true` for both modes.
+        let docs = skewed_block_corpus(1000, 128, 20, 122);
+        let f = SegmentFixture::new(&docs);
+
+        for mode in ["any", "all"] {
+            let out = f.search(SearchParams {
+                q: Some("mouse".into()),
+                prefix: Some(false),
+                query_by: Some("title".into()),
+                match_mode: Some(mode.into()),
+                limit: Some(250),
+                ..Default::default()
+            });
+            assert_eq!(out.found, 250, "mode {mode}: every kept/tail document contains \"mouse\"");
+            assert!(out.found_is_exact, "mode {mode}: a full window must never leave found_is_exact false");
+        }
+    }
+
+    #[test]
+    fn disjunctive_pruning_genuinely_undercounts_a_hopeless_tail() {
+        // The regression test for the exact gap caught during design review:
+        // a single-token query has only one frontier, so without the
+        // driver's self-skip branch (the `None`-pivot case in
+        // `run_disjunctive`), that frontier's own hopeless block would never
+        // be skipped whole — it would always fall back to visiting doc by
+        // doc, and `found` would stay exact no matter how small `limit` is.
+        let docs = skewed_block_corpus(1000, 128, 20, 122);
+        let f = SegmentFixture::new(&docs);
+        let small = f.search(SearchParams {
+            q: Some("mouse".into()),
+            prefix: Some(false),
+            query_by: Some("title".into()),
+            match_mode: Some("any".into()),
+            limit: Some(5),
+            ..Default::default()
+        });
+        let large = f.search(SearchParams {
+            q: Some("mouse".into()),
+            prefix: Some(false),
+            query_by: Some("title".into()),
+            match_mode: Some("any".into()),
+            limit: Some(250),
+            ..Default::default()
+        });
+
+        assert_eq!(large.found, 250, "the reference run is unpruned: every kept/tail doc contains \"mouse\"");
+        assert!(large.found_is_exact);
+
+        assert!(!small.found_is_exact, "a genuinely hopeless block must have been skipped");
+        assert!(
+            small.found < large.found,
+            "small.found={} must genuinely undercount large.found={}",
+            small.found,
+            large.found
+        );
+
+        // Pruning must not corrupt ranking, only the count of the tail it
+        // never visited.
+        let small_ids: Vec<DocId> = small.hits.iter().map(|h| h.doc_id).collect();
+        let large_top5: Vec<DocId> = large.hits.iter().take(5).map(|h| h.doc_id).collect();
+        assert_eq!(small_ids, large_top5);
+    }
+
+    #[test]
+    fn conjunctive_pruning_genuinely_undercounts_a_hopeless_tail() {
+        // Same shape, `All` mode (the default) with two tokens that always
+        // co-occur — proving the hybrid leapfrog+bound-skip driver
+        // (`run_conjunctive`) also skips and also undercounts, not just
+        // `run_disjunctive`. This is the test proving the Context section's
+        // decision to extend real pruning to `All` was actually implemented.
+        let docs = skewed_block_corpus_two_tokens(1000, 128, 20, 122);
+        let f = SegmentFixture::new(&docs);
+        let small = f.search(SearchParams {
+            q: Some("mouse pad".into()),
+            prefix: Some(false),
+            query_by: Some("title".into()),
+            limit: Some(5),
+            ..Default::default()
+        });
+        let large = f.search(SearchParams {
+            q: Some("mouse pad".into()),
+            prefix: Some(false),
+            query_by: Some("title".into()),
+            limit: Some(250),
+            ..Default::default()
+        });
+
+        assert_eq!(large.found, 250, "every kept/tail doc contains both tokens, always together");
+        assert!(large.found_is_exact);
+        assert!(!small.found_is_exact, "a genuinely hopeless block must have been skipped");
+        assert!(
+            small.found < large.found,
+            "small.found={} must genuinely undercount large.found={}",
+            small.found,
+            large.found
+        );
+
+        let small_ids: Vec<DocId> = small.hits.iter().map(|h| h.doc_id).collect();
+        let large_top5: Vec<DocId> = large.hits.iter().take(5).map(|h| h.doc_id).collect();
+        assert_eq!(small_ids, large_top5);
+    }
+
+    #[test]
+    fn conjunctive_correctness_when_not_skipped() {
+        // A moderate, single-block corpus with a large enough window that
+        // theta stays -infinity throughout (no bound ever dips below it, so
+        // neither the bound-skip nor the leapfrog phase ever needs to
+        // reject a genuine candidate) — an exact-intersection sanity check
+        // for `All` mode's leapfrog agreement alone.
+        let mut docs = Vec::new();
+        for i in 0..30 {
+            let mut words = Vec::new();
+            if i % 2 == 0 {
+                words.push("wireless");
+            }
+            if i % 3 == 0 {
+                words.push("mouse");
+            }
+            if words.is_empty() {
+                words.push("filler");
+            }
+            docs.push(json!({"id": i.to_string(), "title": words.join(" "), "description": "d"}));
+        }
+        let f = Fixture::new(&docs);
+        let out = f.search(SearchParams {
+            q: Some("wireless mouse".into()),
+            prefix: Some(false),
+            query_by: Some("title".into()),
+            limit: Some(30),
+            ..Default::default()
+        });
+
+        let expected: Vec<DocId> = (0..30).filter(|i| i % 6 == 0).collect();
+        let mut found_ids: Vec<DocId> = out.matched.iter().collect();
+        found_ids.sort_unstable();
+        assert_eq!(found_ids, expected, "the hand-computed AND of both per-token match sets");
+        assert!(out.found_is_exact);
+    }
+
+    #[test]
+    fn multi_candidate_aggregation_keeps_max_score_and_min_edits_independently() {
+        // One document matched by two candidates of the same query token:
+        // the exact term "wireless" (edits=0, tf=1, so a small contribution)
+        // and a one-edit typo "wirelesss" (edits=1, tf=10, so a much larger
+        // contribution) — both terms occur only in this document, so they
+        // share the same idf and the difference is purely from tf. Max BM25
+        // must pick the typo'd candidate's larger contribution, but the
+        // exact candidate's lower edit distance must still be recorded,
+        // independently of which candidate produced the winning score. A
+        // single document, single field, single token corpus never fills
+        // any window, so this isolates aggregation from any pruning.
+        let mut words = vec!["wireless".to_string()];
+        words.extend(std::iter::repeat_n("wirelesss".to_string(), 10));
+        let f = Fixture::new(&[json!({"id": "1", "title": words.join(" "), "description": ""})]);
+
+        let out = f.search(SearchParams {
+            q: Some("wireless".into()),
+            prefix: Some(false),
+            query_by: Some("title".into()),
+            limit: Some(1),
+            ..Default::default()
+        });
+
+        assert_eq!(out.found, 1);
+        assert_eq!(
+            out.hits[0].components.typo_penalty, 1.0,
+            "min edits (0, from the exact candidate) must win independently of which candidate scored higher"
+        );
+    }
+
+    #[test]
+    fn multi_source_merge_spans_a_segment_and_the_memtable() {
+        // A term whose postings span both a segment (the low doc ids, from
+        // a prior flush) and the memtable (the high doc ids, written since)
+        // — exercising `MergeCursor`'s union merge across a real source
+        // boundary, not just within one source.
+        let schema = schema();
+        let mut flushed = MemTable::new(0, &schema);
+        for i in 0..5 {
+            flushed.insert(
+                ParsedDocument::parse(
+                    json!({"id": i.to_string(), "title": "mouse", "description": "d"}),
+                    &schema,
+                )
+                .unwrap(),
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let encoded = tachyon_index::encode(&flushed, &schema).unwrap();
+        let paths = tachyon_index::SegmentFilePaths {
+            terms: dir.path().join("seg.terms"),
+            ids: dir.path().join("seg.ids"),
+            post: dir.path().join("seg.post"),
+            col: dir.path().join("seg.col"),
+            doc: dir.path().join("seg.doc"),
+        };
+        std::fs::write(&paths.terms, &encoded.terms).unwrap();
+        std::fs::write(&paths.ids, &encoded.ids).unwrap();
+        std::fs::write(&paths.post, &encoded.post).unwrap();
+        std::fs::write(&paths.col, &encoded.col).unwrap();
+        std::fs::write(&paths.doc, &encoded.doc).unwrap();
+        let segment = tachyon_index::SegmentReader::open(&paths, &schema).unwrap();
+
+        // Doc ids keep incrementing across the flush boundary, never reused.
+        let mut live = MemTable::new(5, &schema);
+        for i in 5..10 {
+            live.insert(
+                ParsedDocument::parse(
+                    json!({"id": i.to_string(), "title": "mouse", "description": "d"}),
+                    &schema,
+                )
+                .unwrap(),
+            );
+        }
+
+        let deleted = RoaringBitmap::new();
+        let ctx = SearchContext::new(&schema, vec![&live, &segment], &deleted);
+        let req = SearchRequest::resolve(
+            SearchParams {
+                q: Some("mouse".into()),
+                prefix: Some(false),
+                query_by: Some("title".into()),
+                limit: Some(10),
+                ..Default::default()
+            },
+            &schema,
+        )
+        .unwrap();
+        let out = execute(&ctx, &req);
+
+        assert_eq!(out.found, 10);
+        assert!(out.found_is_exact);
+        let mut ids: Vec<DocId> = out.matched.iter().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..10).collect::<Vec<DocId>>());
+    }
+
+    /// `Collection::merge_locked` (`tachyon-engine`) makes the active
+    /// memtable reserve (`MemTable::reserve`) the exact doc id range a
+    /// merge's output segment just claimed, so its next real insert doesn't
+    /// collide with it — but that reservation makes the memtable *declare*
+    /// (`min_doc_id()..end_doc_id()`) the very same range the segment owns,
+    /// even though nothing is ever live in the memtable's copy of it.
+    /// `SearchContext::is_live`/`field_len` used to stop at the first
+    /// range-matching source (see their doc comments), so a document
+    /// genuinely live in the second, real-owning source was reported dead
+    /// and silently dropped from every search — this reproduces that shape
+    /// directly against `SearchContext`, without needing a real merge.
+    #[test]
+    fn search_context_falls_through_a_hole_only_source_to_the_real_owner() {
+        let schema = schema();
+
+        let mut holes = MemTable::new(0, &schema);
+        holes.reserve(5); // declares 0..5, nothing live in any of it
+
+        let mut owner = MemTable::new(0, &schema);
+        for i in 0..5 {
+            owner.insert(
+                ParsedDocument::parse(
+                    json!({"id": i.to_string(), "title": "mouse", "description": "d"}),
+                    &schema,
+                )
+                .unwrap(),
+            );
+        }
+
+        let deleted = RoaringBitmap::new();
+        // `holes` first, matching `Collection::sources()`'s own
+        // memtable-before-every-segment order — the shape that actually
+        // broke, since `.find()`/`.any()` walk sources in this order.
+        let ctx = SearchContext::new(&schema, vec![&holes, &owner], &deleted);
+
+        for doc_id in 0..5 {
+            assert!(ctx.is_live(doc_id), "doc {doc_id} is live in the second, real-owning source");
+            assert!(ctx.field_len(doc_id, 0) > 0, "doc {doc_id}'s length must come from the real owner");
+            assert!(ctx.value(doc_id, 0).is_some(), "doc {doc_id}'s value must come from the real owner");
+        }
+
+        let req = SearchRequest::resolve(
+            SearchParams {
+                q: Some("mouse".into()),
+                prefix: Some(false),
+                query_by: Some("title".into()),
+                limit: Some(10),
+                ..Default::default()
+            },
+            &schema,
+        )
+        .unwrap();
+        let out = execute(&ctx, &req);
+        assert_eq!(out.found, 5, "every document behind the hole-only source must still be found");
+    }
+
+    #[test]
+    fn found_is_exact_correctness_matrix() {
+        // Small corpus, never fills the window: exact in both modes.
+        let f = corpus();
+        let any = f.search(SearchParams { match_mode: Some("any".into()), ..query("mouse") });
+        let all = f.search(SearchParams { match_mode: Some("all".into()), ..query("mouse") });
+        assert!(any.found_is_exact, "small corpus, any mode");
+        assert!(all.found_is_exact, "small corpus, all mode");
+
+        // A field-only sort disables pruning entirely, regardless of corpus
+        // size — reusing `pruning_is_bypassed_for_a_field_only_sort`'s shape.
+        let mut docs = vec![json!({
+            "id": "winner", "title": "desk accessory", "description": "a mouse pad, barely",
+            "popularity": 0,
+        })];
+        for i in 0..30 {
+            docs.push(json!({
+                "id": format!("filler{i}"),
+                "title": "mouse mouse mouse mouse mouse",
+                "description": "mouse mouse mouse",
+                "popularity": 100 + i,
+            }));
+        }
+        let sorted_out = Fixture::new(&docs).search(SearchParams {
+            sort: Some("popularity:asc".into()),
+            limit: Some(3),
+            match_mode: Some("any".into()),
+            ..query("mouse")
+        });
+        assert!(sorted_out.found_is_exact, "a field-only sort never prunes");
+
+        // A window-filling query that genuinely skips: false, in either mode.
+        let seg = SegmentFixture::new(&skewed_block_corpus(1000, 128, 20, 122));
+        for mode in ["any", "all"] {
+            let out = seg.search(SearchParams {
+                q: Some("mouse".into()),
+                prefix: Some(false),
+                query_by: Some("title".into()),
+                match_mode: Some(mode.into()),
+                limit: Some(5),
+                ..Default::default()
+            });
+            assert!(!out.found_is_exact, "mode {mode}: a window-filling query that genuinely skips");
+        }
     }
 }

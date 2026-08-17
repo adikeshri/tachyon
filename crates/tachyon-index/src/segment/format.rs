@@ -9,11 +9,12 @@
 
 use tachyon_core::{Error, Result};
 
-/// v2: postings, columns, and the document store are read lazily from mmap'd
-/// files via offset tables instead of being fully decoded at open time. v1
-/// segments are not readable by this build — same policy as a tokenizer
-/// change, which also invalidates existing segments.
-pub const SEGMENT_FORMAT_VERSION: u32 = 2;
+/// v3: `.post` postings are grouped into fixed-size blocks with per-block
+/// skip metadata (max doc id, max term frequency, byte offset/length), so a
+/// query can skip a block — or jump straight to one — without decoding the
+/// blocks in between. v1/v2 segments are not readable by this build — same
+/// policy as a tokenizer change, which also invalidates existing segments.
+pub const SEGMENT_FORMAT_VERSION: u32 = 3;
 
 /// Byte length of every segment file's header (8-byte magic + 4-byte version).
 pub const HEADER_LEN: usize = 12;

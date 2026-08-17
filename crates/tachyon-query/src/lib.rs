@@ -14,6 +14,7 @@ pub mod request;
 pub mod score;
 pub mod sort;
 pub mod suggest;
+mod wand;
 
 pub use executor::{execute, ScoredDoc, SearchContext, SearchOutcome};
 pub use facets::compute as compute_facets;

@@ -56,6 +56,20 @@ pub fn term_score(tf: u32, field_len: u32, stats: FieldStats, idf: f32) -> f32 {
     idf * (tf * (K1 + 1.0)) / (tf + K1 * length_norm)
 }
 
+/// Upper bound on [`term_score`] for any document, given only a block's max
+/// term frequency. `length_norm`'s minimum is `1 - B` (as `field_len -> 0`),
+/// and `term_score` is non-increasing in `length_norm` and non-decreasing in
+/// `tf`, so evaluating at that floor is sound regardless of the actual field
+/// length of any document a block holds. Converges to `idf * (K1 + 1.0)` as
+/// `max_tf -> infinity`, the same ceiling `term_frequency_saturates` checks.
+pub fn term_score_bound(max_tf: u32, idf: f32) -> f32 {
+    if max_tf == 0 {
+        return 0.0;
+    }
+    let tf = max_tf as f32;
+    idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +138,37 @@ mod tests {
     fn field_stats_average() {
         assert_eq!(FieldStats::new(4, 40).avg_len, 10.0);
         assert_eq!(FieldStats::new(0, 0).avg_len, 0.0);
+    }
+
+    #[test]
+    fn term_score_bound_is_a_sound_ceiling() {
+        let idf = idf(10, 100);
+        for &max_tf in &[1, 2, 5, 10, 50, 1_000] {
+            let bound = term_score_bound(max_tf, idf);
+            for &avg_len in &[1.0f32, 5.0, 10.0, 50.0, 200.0] {
+                let stats = FieldStats::new(100, (avg_len * 100.0) as u64);
+                for &field_len in &[1u32, 3, 10, 50, 500] {
+                    for &tf in &[1u32, max_tf] {
+                        let actual = term_score(tf, field_len, stats, idf);
+                        assert!(
+                            actual <= bound + 1e-6,
+                            "tf={tf} field_len={field_len} avg_len={avg_len}: actual {actual} exceeded bound {bound}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn term_score_bound_converges_to_the_same_ceiling_as_unbounded_tf() {
+        let idf = idf(10, 100);
+        let bound = term_score_bound(10_000_000, idf);
+        assert!((bound - idf * (K1 + 1.0)).abs() < 1e-3, "got {bound}");
+    }
+
+    #[test]
+    fn term_score_bound_of_zero_tf_is_zero() {
+        assert_eq!(term_score_bound(0, 1.0), 0.0);
     }
 }
