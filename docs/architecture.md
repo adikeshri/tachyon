@@ -289,11 +289,69 @@ sizing `merge_fan_in` on a memory-constrained deployment — smaller values
 trade a bigger memory ceiling for more frequent, cheaper merges — but it is
 not sustained.
 
-## What is not built yet
+## Score-bound pruning
 
-**Block-max WAND.** The executor scores every match. Early termination would
-let it skip documents that cannot reach the top-K, which is what broad queries
-on large corpora need.
+Two independent pruning mechanisms compose on every search: one that never
+changes what a query reports, and one that does.
+
+### Tail pruning (exact)
+
+Every matching document is visited and counted — `found`, `matched`, and
+facets are always exact under this mechanism alone. What gets skipped, for
+documents a cheap upper bound proves cannot reach the final page, is the
+*expensive part* of per-document scoring — proximity, the popularity read,
+best-field `combine()`. The bound is real BM25 (exact, already known once a
+document is resolved) plus the maximum possible value of the other four
+`combine()` signals, which are non-negative-weighted and `[0,1]`-normalized,
+so the sum is a sound ceiling. This mechanism alone was measured, before true
+WAND existed, at a modest win (5M docs, ~9%-broad query: p95 494 ms → 454 ms)
+precisely because it never reduces how many documents get visited in the
+first place — see below for what does.
+
+### True block-max WAND (postings-level, approximate)
+
+Classical block-max WAND skips documents entirely, jumping ahead in sorted
+posting lists using per-block score bounds — incompatible with the exact
+counts the mechanism above preserves. This is now built as a genuinely
+separate, composed layer: `.post`'s v3 format groups a term's postings into
+fixed 128-document blocks, each carrying its own max doc id, max term
+frequency, and byte offset, so a query can skip — or jump straight past — a
+whole block without decoding a single posting inside it. A lazy
+`PostingCursor` (`crates/tachyon-index/src/cursor.rs`, `segment/cursor.rs`)
+walks one block at a time; `tachyon-query/src/wand.rs` merges cursors across
+sources and candidate terms into one frontier per query token, then runs a
+document-at-a-time driver:
+
+- **Disjunctive (`match_mode=any`)**: classic WAND pivot selection — sum
+  live frontiers' current-block bounds in ascending doc-id order; the first
+  prefix whose bound clears the current top-K threshold names the pivot
+  document. When *no* prefix clears it — the case a naive "always pick a
+  pivot" design misses, and the one that matters most for a single-token
+  query, which has only one frontier to pivot against — every live frontier
+  skips its own hopeless block outright.
+- **Conjunctive (`match_mode=all`, the default)**: a genuine match needs
+  every token, so the bound is the *sum* of every frontier's current-block
+  bound, checked *before* searching for agreement. When it clears the
+  threshold, exact leapfrog intersection finds the next doc id every
+  frontier agrees on — leapfrog's own catch-up never skips a genuine match,
+  so it alone never causes approximation. When the bound doesn't clear, the
+  intersection search is skipped entirely, which is what makes the default
+  mode benefit from this too, not just `any`.
+
+Both drivers still hand every visited document through the exact tail
+pruning above. The only source of approximation is a document that's never
+visited at all because a block was skipped — signaled per response by
+`found_is_exact: false`. Facets inherit the same caveat automatically, since
+they count over the same visited set `found` does.
+
+Measured on the same 5M-document HTTP benchmark, broad query (`any` mode,
+~9% of the corpus): search p95 went from 454 ms (tail pruning alone) to
+**278 ms** — the O(matches) walk itself is now genuinely reduced, not just
+its tail. `match_mode=all`, the default, does even better here (p95 **252
+ms**) since leapfrog intersection narrows the candidate set before the
+bound check ever runs.
+
+## What is not built yet
 
 **Streaming merges.** A merge currently rebuilds its input through a scratch
 memtable rather than merging the already-encoded structures directly, which

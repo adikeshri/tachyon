@@ -341,6 +341,7 @@ impl Collection {
 
         Ok(SearchResponse {
             found: outcome.found,
+            found_is_exact: outcome.found_is_exact,
             search_time_ms: started.elapsed().as_millis() as u64,
             hits,
             facets,
@@ -559,7 +560,18 @@ impl Collection {
 
         // Rebuild: every live, non-tombstoned document across the victims,
         // re-validated and re-tokenized exactly like a fresh insert.
-        let merge_base = inner.state.next_doc_id;
+        //
+        // The range this claims must start from the *active* memtable's own
+        // `next_doc_id()`, not `inner.state.next_doc_id` — the two agree
+        // when merging runs right after a flush (the common case: the fresh
+        // memtable is still empty, so its `next_doc_id()` equals the base
+        // `state.next_doc_id` recorded for it), but a merge invoked with
+        // documents already sitting in the memtable (e.g. a manual
+        // `Collection::merge()` call) would otherwise hand out ids the
+        // memtable already assigned to those documents. Below, once this
+        // range is claimed, the memtable is told to skip over it too — see
+        // that call's comment for why.
+        let merge_base = inner.memtable.next_doc_id();
         let mut merged = MemTable::new(merge_base, schema);
         for reader in &victim_readers {
             for doc_id in reader.min_doc_id()..reader.end_doc_id() {
@@ -575,6 +587,10 @@ impl Collection {
                 merged.insert(parsed);
             }
         }
+        // How many ids `merged` actually claimed out of `merge_base`'s range
+        // — 0 if every victim document turned out to be dead, same as
+        // `wrote_segment` below computes it.
+        let claimed = merged.next_doc_id() - merge_base;
 
         let mut new_state = inner.state.clone();
 
@@ -637,6 +653,12 @@ impl Collection {
         meta::write_state(layout, &schema.name, &new_state)?;
 
         inner.state = new_state;
+        // The active memtable's own `next_doc_id()` was `merge_base` before
+        // this merge started (see where `merge_base` is computed above) —
+        // without this, its next real insert would hand out `merge_base`
+        // again, colliding with the very first doc id this merge just
+        // wrote into a segment.
+        inner.memtable.reserve(claimed as usize);
         for &i in victims.iter().rev() {
             inner.segments.remove(i);
         }
@@ -1356,5 +1378,95 @@ mod tests {
 
         let reopened = Collection::open(&layout, "products", &config).unwrap();
         assert_eq!(reopened.stats().num_documents, 4);
+    }
+
+    /// A merge's output segment must never claim a doc id the *active*
+    /// memtable is going to hand out later — regression test for a bug
+    /// where `merge_locked` computed its output range from
+    /// `state.next_doc_id`, the exact id the fresh post-flush memtable
+    /// already started counting from, without telling that memtable to
+    /// skip past the range the merge just claimed. Left unfixed, a later
+    /// real upsert into the memtable silently reused an id a merged segment
+    /// already owned — `MergeCursor` then saw the same doc id surface from
+    /// two different sources on the same query, breaking the
+    /// ascending-order guarantee `tachyon-query`'s WAND drivers depend on
+    /// and panicking `RoaringBitmap::from_sorted_iter` in `executor.rs`.
+    ///
+    /// Fixing that (`MemTable::reserve`, called from `merge_locked`) traded
+    /// one bug for a subtler one: a memtable that reserved a merge's range
+    /// still *declares* that range as its own via `base()`/`next_doc_id()`
+    /// even though nothing is ever live there, so a doc id can legitimately
+    /// fall inside two sources' declared ranges at once now. This is
+    /// asserted directly below, and separately the search-side fallout is
+    /// checked: `SearchContext::is_live`/`field_len` used to stop at the
+    /// *first* range-matching source (`executor.rs`), so a genuinely live
+    /// document in the second, real owner was reported dead and silently
+    /// excluded from every search. Both fixes are needed together.
+    ///
+    /// Many small flush+merge rounds are needed to give the bug room to
+    /// manifest — a single merge round (every other merge test here) never
+    /// exercised more than one live memtable generation past the merge.
+    #[test]
+    fn repeated_merges_never_hand_the_active_memtable_a_claimed_doc_id() {
+        let (_dir, layout, config) = merge_harness(3, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        let n = 200;
+        for i in 0..n {
+            c.upsert(product(&(i + 1).to_string(), "widget gadget", 100 + i)).unwrap();
+        }
+        assert!(c.stats().num_segments > 1, "sanity: this many docs must have forced a merge");
+
+        // Segments' own declared ranges must be pairwise disjoint — unlike
+        // the memtable, a segment's range is fixed for its whole life at
+        // exactly the ids one memtable generation used, so this always held
+        // even before the fix; asserted here as a sanity check on the setup.
+        let inner = c.inner.read();
+        let mut seg_ranges: Vec<(DocId, DocId)> =
+            inner.state.segments.iter().map(|s| (s.min_doc_id, s.max_doc_id)).collect();
+        seg_ranges.sort_unstable();
+        for w in seg_ranges.windows(2) {
+            assert!(w[0].1 < w[1].0, "overlapping segment ranges {:?} and {:?}", w[0], w[1]);
+        }
+        drop(inner);
+
+        // A broad, window-filling `any`-mode query with a small `limit` is
+        // exactly what drove pruning through every source in the real
+        // crash: this must not panic (the original failure mode). `found`
+        // itself is allowed to be an approximate lower bound once pruning
+        // engages (by design, see `wand.rs`'s module doc), so it isn't
+        // checked here.
+        c.search(SearchParams {
+            q: Some("widget".into()),
+            match_mode: Some("any".into()),
+            limit: Some(5),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // A window big enough to hold every match never lets pruning skip
+        // anything (same reasoning as this file's other exact-count
+        // assertions), so `found` must be exact here — this is what
+        // actually confirms no document was lost to a doc-id collision, or
+        // to a live document behind a reserved-but-declared memtable range
+        // being reported dead.
+        let exhaustive = c
+            .search(SearchParams {
+                q: Some("widget".into()),
+                match_mode: Some("any".into()),
+                limit: Some(n as usize),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(exhaustive.found_is_exact, "a full window must never skip a block");
+        assert_eq!(exhaustive.found, n as usize);
+
+        // A doc-id collision would also silently corrupt content (two
+        // documents fighting over the same slot in different sources) —
+        // confirm every original document still reads back correctly.
+        for i in 0..n {
+            let doc = c.get(&(i + 1).to_string()).unwrap();
+            assert_eq!(doc["price"], json!(100 + i));
+        }
     }
 }

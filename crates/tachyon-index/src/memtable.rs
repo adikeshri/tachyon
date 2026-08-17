@@ -151,6 +151,22 @@ impl MemTable {
         self.base + self.docs.len() as DocId
     }
 
+    /// Retire the next `count` doc ids without assigning any document to
+    /// them — holes exactly like [`Self::remove`] leaves behind, just never
+    /// having been live in the first place.
+    ///
+    /// Needed when something outside this memtable (a segment merge) has
+    /// already handed out a range of ids starting at this memtable's own
+    /// `next_doc_id()` — a merge computes its output segment's id range
+    /// from "whatever this collection's active memtable hasn't claimed
+    /// yet," which is exactly this memtable's `next_doc_id()`. Without this
+    /// call, this memtable's *own* next insert would hand out that same
+    /// first id again, since nothing else here advances `next_doc_id()`
+    /// except an actual `insert`.
+    pub fn reserve(&mut self, count: usize) {
+        self.docs.resize_with(self.docs.len() + count, || None);
+    }
+
     /// Live document count, excluding replaced and deleted documents.
     pub fn len(&self) -> usize {
         self.live
@@ -323,6 +339,31 @@ mod tests {
         m.remove(a);
         let seen: Vec<_> = m.iter().map(|(id, d)| (id, d.id.clone())).collect();
         assert_eq!(seen, vec![(11, "b".to_string()), (12, "c".to_string())]);
+    }
+
+    #[test]
+    fn reserve_advances_next_doc_id_without_creating_a_live_document() {
+        let mut m = memtable(10);
+        m.insert(doc("a", "one")); // id 10
+
+        m.reserve(3); // ids 11..14 retired, never assigned to a document
+
+        assert_eq!(m.next_doc_id(), 14, "the next real insert must skip past the reserved ids");
+        for id in 11..14 {
+            assert!(m.get(id).is_none(), "a reserved id must never resolve to a document");
+            assert!(!m.is_live(id), "a reserved id must never be live");
+        }
+        assert_eq!(m.len(), 1, "reserving ids must not change the live count");
+        assert!(
+            m.iter().all(|(id, _)| id != 11 && id != 12 && id != 13),
+            "iteration must skip reserved ids too"
+        );
+
+        assert_eq!(
+            m.insert(doc("b", "two")),
+            14,
+            "the next insert lands right after the reserved range"
+        );
     }
 
     #[test]

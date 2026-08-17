@@ -10,6 +10,7 @@
 //! decodes them on demand.
 
 mod codec;
+mod cursor;
 mod format;
 mod reader;
 

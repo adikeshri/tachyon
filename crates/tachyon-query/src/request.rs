@@ -212,6 +212,14 @@ pub struct Hit {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SearchResponse {
     pub found: usize,
+    /// `false` iff pruning skipped at least one block of at least one
+    /// term's postings while answering this query — for EITHER match mode;
+    /// the exactness guarantee is tied to whether a skip occurred, not to
+    /// `match_mode`. Conservative: may occasionally read `false` when a
+    /// skipped region held no additional matches, never `true` when a skip
+    /// occurred. Always serialized (no `skip_serializing_if`) — unlike
+    /// `facets`, this is meaningful on every response.
+    pub found_is_exact: bool,
     pub search_time_ms: u64,
     pub hits: Vec<Hit>,
     #[serde(skip_serializing_if = "Option::is_none")]

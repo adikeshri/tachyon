@@ -61,6 +61,7 @@ curl 'localhost:8108/collections/products/search?q=wireless+mouse'
 ```json
 {
   "found": 1,
+  "found_is_exact": true,
   "search_time_ms": 0,
   "hits": [
     { "document": { "id": "1", "title": "Wireless Mouse", "brand": "Logitech", "price": 2999 },
@@ -145,10 +146,19 @@ memory-constrained deployment, but momentary, not sustained. A direct
 merge of the already-encoded structures, avoiding the scratch memtable
 entirely, is the natural follow-up if this proves to matter in practice.
 
-**Broad queries scale linearly.** Every matching document is scored. Real
-catalogues are far more selective than a broad query — and adding a filter
-already halves the cost — but the fix is block-max WAND early termination,
-which would let the executor skip documents that cannot reach the top-K.
+**Broad queries no longer visit every match unconditionally.** A block-level
+score bound (true block-max WAND, `.post`'s v3 format) now skips whole
+regions of a term's postings — and, when the bound can't clear the current
+top-K threshold, whole documents — without decoding them at all, for both
+`match_mode=any` and the default `match_mode=all`. `found`/facets stay exact
+only when nothing was skipped, signaled per response by `found_is_exact`;
+when pruning does engage, they become a lower bound, not a false one.
+Measured on a 5M-doc, ~9%-broad-query benchmark: search p95 went 494 ms
+(before any of this pruning existed) → 454 ms (exact tail-only pruning) →
+**278 ms** (`any` mode) / **252 ms** (`all` mode, the default) with true
+WAND. Real catalogues are far more selective than this benchmark's
+deliberately-broad query, and adding a filter still reduces cost further on
+top of this.
 
 **Not yet built:** distributed clustering, replication, synonyms, stemming, stop
 words, highlighting, geo search, and nested documents. All are explicit

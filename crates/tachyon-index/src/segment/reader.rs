@@ -20,11 +20,12 @@ use serde_json::Value as Json;
 use tachyon_core::{CollectionSchema, DocId, Error, FieldId, Result, Value};
 
 use crate::columns::{KeywordColumn, NumericColumn};
+use crate::cursor::PostingCursor;
 use crate::fuzzy::FuzzyMatcher;
-use crate::inverted::FieldPostings;
 use crate::source::IndexSource;
 
 use super::codec::{self, ColHeader, DocHeader, PostHeader};
+use super::cursor::SegmentPostingCursor;
 use super::format::{HEADER_LEN, IDS_MAGIC, TERMS_MAGIC};
 
 /// The five files one segment is stored as.
@@ -175,10 +176,14 @@ impl IndexSource for SegmentReader {
         }
     }
 
-    fn postings(&self, term: &str, field: FieldId) -> Option<Cow<'_, FieldPostings>> {
+    fn posting_cursor(&self, term: &str, field: FieldId) -> Option<Box<dyn PostingCursor + '_>> {
         let term_id = self.terms.get(term)?;
-        match codec::decode_term_postings(&self.post, &self.post_header, term_id) {
-            Ok(fields) => fields.into_iter().find(|(f, _)| *f == field).map(|(_, p)| Cow::Owned(p)),
+        match codec::decode_term_field_blocks(&self.post, &self.post_header, term_id, field) {
+            Ok(Some(term_field)) => {
+                Some(Box::new(SegmentPostingCursor::new(&self.post, term_field))
+                    as Box<dyn PostingCursor + '_>)
+            }
+            Ok(None) => None,
             Err(e) => {
                 tracing::warn!(term, field, error = %e, "segment: failed to decode postings");
                 None
@@ -187,18 +192,18 @@ impl IndexSource for SegmentReader {
     }
 
     // Overridden rather than left to the trait's default (which goes through
-    // `postings()`): both only ever need doc ids, never positions, and
+    // `posting_cursor()`): both only ever need doc ids, never positions, and
     // autocomplete calls these across every candidate term and every source.
-    // Decoding — and allocating — full posting lists including positions just
-    // to count them would make the cheap common case pay for data nobody
-    // asked for.
+    // `doc_freq` in particular is a stored count (O(1) once the term's block
+    // directory is located), not a walk.
 
     fn doc_freq(&self, term: &str, field: FieldId) -> u32 {
         let Some(term_id) = self.terms.get(term) else { return 0 };
-        match codec::decode_term_field_doc_ids(&self.post, &self.post_header, term_id, field) {
-            Ok(doc_ids) => doc_ids.len() as u32,
+        match codec::decode_term_field_blocks(&self.post, &self.post_header, term_id, field) {
+            Ok(Some(term_field)) => term_field.doc_freq,
+            Ok(None) => 0,
             Err(e) => {
-                tracing::warn!(term, field, error = %e, "segment: failed to decode doc ids");
+                tracing::warn!(term, field, error = %e, "segment: failed to decode postings");
                 0
             }
         }
@@ -363,22 +368,33 @@ mod tests {
             }
         }
 
+        // Drain a source's cursor into the same `(doc_id, positions)` shape
+        // `posting_cursor()` promises, one `advance()` at a time — the
+        // comparable shape both `mem`/`seg` are checked against below.
+        fn drain(
+            source: &dyn IndexSource,
+            term: &str,
+            field: FieldId,
+        ) -> Option<Vec<(u32, Vec<u32>)>> {
+            let mut cursor = source.posting_cursor(term, field)?;
+            let mut out = Vec::new();
+            while let Some(doc_id) = cursor.doc_id() {
+                out.push((doc_id, cursor.positions()));
+                cursor.advance();
+            }
+            Some(out)
+        }
+
         for term in ["mouse", "wireless", "pad", "blue", "red", "keyboard", "nope"] {
             for field in [0u16, 1] {
                 // The memtable's postings still carry the hole until a
                 // flush; a segment never does. Filter to what the memtable
                 // itself considers live before comparing.
-                let mem_docs: Option<Vec<(u32, Vec<u32>)>> = mem.postings(term, field).map(|p| {
-                    p.docs
-                        .iter()
-                        .filter(|d| mem.is_live(d.doc_id))
-                        .map(|d| (d.doc_id, d.positions.clone()))
-                        .collect()
+                let mem_docs = drain(mem, term, field).map(|docs| {
+                    docs.into_iter().filter(|(doc_id, _)| mem.is_live(*doc_id)).collect::<Vec<_>>()
                 });
                 let mem_docs = mem_docs.filter(|d| !d.is_empty());
-                let seg_docs: Option<Vec<(u32, Vec<u32>)>> = seg
-                    .postings(term, field)
-                    .map(|p| p.docs.iter().map(|d| (d.doc_id, d.positions.clone())).collect());
+                let seg_docs = drain(seg, term, field);
                 assert_eq!(mem_docs, seg_docs, "term {term:?} field {field}");
 
                 // doc_freq/live_doc_freq go through a separate, positions-free
