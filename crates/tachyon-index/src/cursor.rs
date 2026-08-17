@@ -83,8 +83,8 @@ impl PostingCursor for MemTablePostingCursor<'_> {
     }
 
     fn advance_to(&mut self, target: DocId) -> Option<DocId> {
-        self.pos += self.docs[self.pos.min(self.docs.len())..]
-            .partition_point(|d| d.doc_id < target);
+        self.pos +=
+            self.docs[self.pos.min(self.docs.len())..].partition_point(|d| d.doc_id < target);
         self.doc_id()
     }
 
@@ -304,7 +304,9 @@ mod tests {
             self.doc_id()
         }
         fn max_remaining_tf(&self) -> u32 {
-            self.docs.get(self.pos..).map_or(0, |rest| rest.iter().map(|&(_, tf)| tf).max().unwrap_or(0))
+            self.docs
+                .get(self.pos..)
+                .map_or(0, |rest| rest.iter().map(|&(_, tf)| tf).max().unwrap_or(0))
         }
         fn current_block_last_doc_id(&self) -> Option<DocId> {
             self.block_last_doc_id
@@ -320,8 +322,10 @@ mod tests {
         // be skipped straight over.
         let a = FixedCursor { docs: vec![(10, 1), (200, 1)], pos: 0, block_last_doc_id: Some(100) };
         let b = FixedCursor { docs: vec![(20, 1), (22, 1)], pos: 0, block_last_doc_id: Some(25) };
-        let merged =
-            MergeCursor::new(vec![Box::new(a) as Box<dyn PostingCursor>, Box::new(b) as Box<dyn PostingCursor>]);
+        let merged = MergeCursor::new(vec![
+            Box::new(a) as Box<dyn PostingCursor>,
+            Box::new(b) as Box<dyn PostingCursor>,
+        ]);
         assert_eq!(merged.doc_id(), Some(10), "A holds the smaller current doc id");
         assert_eq!(merged.current_block_last_doc_id(), Some(25), "bounded by B's tighter block");
     }
@@ -334,6 +338,10 @@ mod tests {
             Box::new(segment_like) as Box<dyn PostingCursor>,
             Box::new(MemTablePostingCursor::new(&mem)) as Box<dyn PostingCursor>,
         ]);
-        assert_eq!(merged.current_block_last_doc_id(), None, "the memtable child has no block bound");
+        assert_eq!(
+            merged.current_block_last_doc_id(),
+            None,
+            "the memtable child has no block bound"
+        );
     }
 }

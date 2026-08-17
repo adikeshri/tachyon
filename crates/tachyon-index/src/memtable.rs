@@ -354,9 +354,16 @@ mod tests {
             assert!(!m.is_live(id), "a reserved id must never be live");
         }
         assert_eq!(m.len(), 1, "reserving ids must not change the live count");
-        assert!(m.iter().all(|(id, _)| id != 11 && id != 12 && id != 13), "iteration must skip reserved ids too");
+        assert!(
+            m.iter().all(|(id, _)| id != 11 && id != 12 && id != 13),
+            "iteration must skip reserved ids too"
+        );
 
-        assert_eq!(m.insert(doc("b", "two")), 14, "the next insert lands right after the reserved range");
+        assert_eq!(
+            m.insert(doc("b", "two")),
+            14,
+            "the next insert lands right after the reserved range"
+        );
     }
 
     #[test]

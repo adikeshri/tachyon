@@ -131,7 +131,10 @@ mod tests {
     fn schema() -> CollectionSchema {
         CollectionSchema::new(
             "products",
-            vec![FieldSchema::new("title", FieldType::Text), FieldSchema::new("tags", FieldType::Text)],
+            vec![
+                FieldSchema::new("title", FieldType::Text),
+                FieldSchema::new("tags", FieldType::Text),
+            ],
         )
     }
 
@@ -155,10 +158,16 @@ mod tests {
         (m, schema)
     }
 
-    fn open_cursor<'a>(post: &'a [u8], terms: &fst::Map<Vec<u8>>, term: &str, field: u16) -> SegmentPostingCursor<'a> {
+    fn open_cursor<'a>(
+        post: &'a [u8],
+        terms: &fst::Map<Vec<u8>>,
+        term: &str,
+        field: u16,
+    ) -> SegmentPostingCursor<'a> {
         let header = decode_post_header(post).unwrap();
         let term_id = terms.get(term).unwrap();
-        let term_field = codec::decode_term_field_blocks(post, &header, term_id, field).unwrap().unwrap();
+        let term_field =
+            codec::decode_term_field_blocks(post, &header, term_id, field).unwrap().unwrap();
         SegmentPostingCursor::new(post, term_field)
     }
 

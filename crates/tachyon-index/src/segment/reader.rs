@@ -180,7 +180,8 @@ impl IndexSource for SegmentReader {
         let term_id = self.terms.get(term)?;
         match codec::decode_term_field_blocks(&self.post, &self.post_header, term_id, field) {
             Ok(Some(term_field)) => {
-                Some(Box::new(SegmentPostingCursor::new(&self.post, term_field)) as Box<dyn PostingCursor + '_>)
+                Some(Box::new(SegmentPostingCursor::new(&self.post, term_field))
+                    as Box<dyn PostingCursor + '_>)
             }
             Ok(None) => None,
             Err(e) => {
@@ -370,7 +371,11 @@ mod tests {
         // Drain a source's cursor into the same `(doc_id, positions)` shape
         // `posting_cursor()` promises, one `advance()` at a time — the
         // comparable shape both `mem`/`seg` are checked against below.
-        fn drain(source: &dyn IndexSource, term: &str, field: FieldId) -> Option<Vec<(u32, Vec<u32>)>> {
+        fn drain(
+            source: &dyn IndexSource,
+            term: &str,
+            field: FieldId,
+        ) -> Option<Vec<(u32, Vec<u32>)>> {
             let mut cursor = source.posting_cursor(term, field)?;
             let mut out = Vec::new();
             while let Some(doc_id) = cursor.doc_id() {

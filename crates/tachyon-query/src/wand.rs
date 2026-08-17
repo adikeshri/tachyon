@@ -129,7 +129,11 @@ impl FieldCandidates<'_> {
             }
         }
 
-        matched.then_some(FieldMatch { contribution: best_contribution, edits: best_edits, positions })
+        matched.then_some(FieldMatch {
+            contribution: best_contribution,
+            edits: best_edits,
+            positions,
+        })
     }
 }
 
@@ -379,7 +383,12 @@ impl<'a> DocScorer<'a> {
             let row: Vec<Option<FieldMatch>> = frontiers
                 .iter()
                 .map(|frontier| {
-                    frontier.fields[field_pos].resolve(doc_id, field_len, stats, self.needs_positions)
+                    frontier.fields[field_pos].resolve(
+                        doc_id,
+                        field_len,
+                        stats,
+                        self.needs_positions,
+                    )
                 })
                 .collect();
             matches.push(row);
@@ -450,7 +459,10 @@ impl<'a> DocScorer<'a> {
 
         let components = ScoreComponents {
             bm25: score::normalize_bm25(best_bm25),
-            field_boost: score::normalize_field_boost(self.req.query_by[best_field].1, self.max_boost),
+            field_boost: score::normalize_field_boost(
+                self.req.query_by[best_field].1,
+                self.max_boost,
+            ),
             proximity,
             typo_penalty: score::typo_penalty(evidence.field_edits(best_field), self.allowed_edits),
             popularity,
@@ -474,10 +486,14 @@ impl<'a> DocScorer<'a> {
 ///
 /// A phrase must be satisfied within one field — `title` ending in "mouse"
 /// and `description` starting with "pad" is not the phrase "mouse pad".
-fn satisfies_phrases(evidence: &DocEvidence, req: &SearchRequest, phrases: &[(usize, usize)]) -> bool {
-    phrases
-        .iter()
-        .all(|&(start, end)| (0..req.query_by.len()).any(|field| phrase_in_field(evidence, field, start, end)))
+fn satisfies_phrases(
+    evidence: &DocEvidence,
+    req: &SearchRequest,
+    phrases: &[(usize, usize)],
+) -> bool {
+    phrases.iter().all(|&(start, end)| {
+        (0..req.query_by.len()).any(|field| phrase_in_field(evidence, field, start, end))
+    })
 }
 
 fn phrase_in_field(evidence: &DocEvidence, field: usize, start: usize, end: usize) -> bool {
@@ -582,7 +598,15 @@ pub(crate) fn run_disjunctive(
                     }
                 }
 
-                visit_and_score(pivot_doc, frontiers, query, scorer, &mut matched_ids, top_k, candidates);
+                visit_and_score(
+                    pivot_doc,
+                    frontiers,
+                    query,
+                    scorer,
+                    &mut matched_ids,
+                    top_k,
+                    candidates,
+                );
 
                 for &i in &live {
                     if frontiers[i].doc_id() == Some(pivot_doc) {
@@ -655,7 +679,8 @@ pub(crate) fn run_conjunctive(
         let bound_sum: f32 = frontiers.iter().map(TokenFrontier::score_bound).sum();
         if bound_to_combined_score(bound_sum, scorer) < theta {
             any_skip = true;
-            let skip_to = frontiers.iter().filter_map(TokenFrontier::current_block_last_doc_id).min();
+            let skip_to =
+                frontiers.iter().filter_map(TokenFrontier::current_block_last_doc_id).min();
             for f in frontiers.iter_mut() {
                 match skip_to {
                     Some(d) => f.advance_to(d.saturating_add(1)),
@@ -729,7 +754,13 @@ mod tests {
         hits: Vec<Ranked>,
     }
 
-    fn run(m: &MemTable, schema: &CollectionSchema, q: &str, mode: MatchMode, limit: usize) -> Outcome {
+    fn run(
+        m: &MemTable,
+        schema: &CollectionSchema,
+        q: &str,
+        mode: MatchMode,
+        limit: usize,
+    ) -> Outcome {
         let deleted = RoaringBitmap::new();
         let ctx = SearchContext::new(schema, vec![m], &deleted);
         let match_mode = match mode {
@@ -861,7 +892,9 @@ mod tests {
 
         let top_ids = |o: &Outcome, k: usize| {
             let mut hits = o.hits.clone();
-            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.doc_id.cmp(&b.doc_id)));
+            hits.sort_by(|a, b| {
+                b.score.partial_cmp(&a.score).unwrap().then(a.doc_id.cmp(&b.doc_id))
+            });
             hits.truncate(k);
             hits.into_iter().map(|h| h.doc_id).collect::<Vec<_>>()
         };

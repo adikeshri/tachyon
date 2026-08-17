@@ -1032,9 +1032,10 @@ mod tests {
 
         for (term, field) in [("mouse", 0u16), ("blue", 1), ("pad", 0)] {
             let term_id = terms.get(term).unwrap();
-            let expected: Vec<DocId> = decode_term_field_full(&encoded.post, &header, term_id, field)
-                .map(|p| p.docs.iter().map(|d| d.doc_id).collect())
-                .unwrap_or_default();
+            let expected: Vec<DocId> =
+                decode_term_field_full(&encoded.post, &header, term_id, field)
+                    .map(|p| p.docs.iter().map(|d| d.doc_id).collect())
+                    .unwrap_or_default();
 
             let lean = decode_term_field_doc_ids(&encoded.post, &header, term_id, field).unwrap();
             assert_eq!(lean, expected, "term {term:?} field {field}");
@@ -1231,9 +1232,14 @@ mod tests {
         let header = decode_post_header(&encoded.post).unwrap();
         let term_id = terms.get("mouse").unwrap();
 
-        let term_field = decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
+        let term_field =
+            decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
         assert_eq!(term_field.doc_freq, (POSTING_BLOCK_SIZE * 2) as u32);
-        assert_eq!(term_field.blocks.len(), 2, "256 docs at block size 128 is exactly two full blocks");
+        assert_eq!(
+            term_field.blocks.len(),
+            2,
+            "256 docs at block size 128 is exactly two full blocks"
+        );
         assert_eq!(term_field.blocks[0].last_doc_id, POSTING_BLOCK_SIZE as u32 - 1);
         assert_eq!(term_field.blocks[1].last_doc_id, POSTING_BLOCK_SIZE as u32 * 2 - 1);
 
@@ -1251,7 +1257,8 @@ mod tests {
         let header = decode_post_header(&encoded.post).unwrap();
         let term_id = terms.get("mouse").unwrap();
 
-        let term_field = decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
+        let term_field =
+            decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
         assert_eq!(term_field.blocks.len(), 2);
         let first = decode_block_skeleton(&encoded.post, &term_field.blocks[0]).unwrap();
         let second = decode_block_skeleton(&encoded.post, &term_field.blocks[1]).unwrap();
@@ -1268,7 +1275,8 @@ mod tests {
         let terms = validate_and_load_fst(&encoded.terms, TERMS_MAGIC);
         let header = decode_post_header(&encoded.post).unwrap();
         let term_id = terms.get("mouse").unwrap();
-        let term_field = decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
+        let term_field =
+            decode_term_field_blocks(&encoded.post, &header, term_id, 0).unwrap().unwrap();
 
         // The last doc of block 0 and the first doc of block 1 straddle the
         // boundary — both must decode correctly from their own block.
@@ -1287,7 +1295,11 @@ mod tests {
         .unwrap();
         let positions_first_of_1 =
             decode_positions_at(&encoded.post, block1.positions_offsets[0], block1.tfs[0]).unwrap();
-        assert_eq!(positions_last_of_0, vec![0], "single-token title: \"mouse\" is always position 0");
+        assert_eq!(
+            positions_last_of_0,
+            vec![0],
+            "single-token title: \"mouse\" is always position 0"
+        );
         assert_eq!(positions_first_of_1, vec![0]);
     }
 

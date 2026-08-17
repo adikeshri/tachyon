@@ -204,7 +204,8 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
         .is_none_or(|clauses| clauses.first().is_some_and(|c| c.key == SortKey::TextMatch));
 
     let mut frontiers = wand::build_frontiers(ctx, req, &expansions);
-    let scorer = wand::DocScorer::new(ctx, req, filter, allowed_edits, needs_positions, tokens.len());
+    let scorer =
+        wand::DocScorer::new(ctx, req, filter, allowed_edits, needs_positions, tokens.len());
     let mut top_k = prunable.then(|| TopKByScore::new(req.window()));
     let mut candidates: Vec<Ranked> = Vec::new(); // used only when `top_k` is None
 
@@ -284,8 +285,8 @@ impl TopKByScore {
             return;
         }
         let Some(worst) = self.heap.peek() else { return };
-        let replaces =
-            ranked.score > worst.0.score || (ranked.score == worst.0.score && ranked.doc_id < worst.0.doc_id);
+        let replaces = ranked.score > worst.0.score
+            || (ranked.score == worst.0.score && ranked.doc_id < worst.0.doc_id);
         if replaces {
             self.heap.pop();
             self.heap.push(ScoredEntry(ranked));
@@ -1362,7 +1363,10 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(out.found, 250, "mode {mode}: every kept/tail document contains \"mouse\"");
-            assert!(out.found_is_exact, "mode {mode}: a full window must never leave found_is_exact false");
+            assert!(
+                out.found_is_exact,
+                "mode {mode}: a full window must never leave found_is_exact false"
+            );
         }
     }
 
@@ -1393,7 +1397,10 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(large.found, 250, "the reference run is unpruned: every kept/tail doc contains \"mouse\"");
+        assert_eq!(
+            large.found, 250,
+            "the reference run is unpruned: every kept/tail doc contains \"mouse\""
+        );
         assert!(large.found_is_exact);
 
         assert!(!small.found_is_exact, "a genuinely hopeless block must have been skipped");
@@ -1622,8 +1629,14 @@ mod tests {
 
         for doc_id in 0..5 {
             assert!(ctx.is_live(doc_id), "doc {doc_id} is live in the second, real-owning source");
-            assert!(ctx.field_len(doc_id, 0) > 0, "doc {doc_id}'s length must come from the real owner");
-            assert!(ctx.value(doc_id, 0).is_some(), "doc {doc_id}'s value must come from the real owner");
+            assert!(
+                ctx.field_len(doc_id, 0) > 0,
+                "doc {doc_id}'s length must come from the real owner"
+            );
+            assert!(
+                ctx.value(doc_id, 0).is_some(),
+                "doc {doc_id}'s value must come from the real owner"
+            );
         }
 
         let req = SearchRequest::resolve(
@@ -1683,7 +1696,10 @@ mod tests {
                 limit: Some(5),
                 ..Default::default()
             });
-            assert!(!out.found_is_exact, "mode {mode}: a window-filling query that genuinely skips");
+            assert!(
+                !out.found_is_exact,
+                "mode {mode}: a window-filling query that genuinely skips"
+            );
         }
     }
 }
