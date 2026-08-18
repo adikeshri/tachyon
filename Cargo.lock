@@ -1109,6 +1109,7 @@ name = "tachyon-bench"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "serde_json",
  "tachyon-core",
  "tachyon-engine",
