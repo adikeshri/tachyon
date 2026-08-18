@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use memmap2::{Mmap, MmapOptions};
 use roaring::RoaringBitmap;
@@ -47,6 +48,19 @@ pub struct SegmentReader {
     col_header: ColHeader,
     doc: Mmap,
     doc_header: DocHeader,
+    /// One slot per field, filled in on first access and never rebuilt after
+    /// — a segment's columns never change once written, so decoding a
+    /// numeric column (every `(value, doc_id)` pair, resorted into a
+    /// `NumericColumn`) or a keyword column (every distinct value's
+    /// `RoaringBitmap`, deserialized) is real work worth doing at most once
+    /// per field per segment lifetime rather than once per query. Filters
+    /// and facets both go through these, and a query with either used to pay
+    /// this decode cost fresh on every call, which is why filtering used to
+    /// make a query *slower* than the unfiltered version despite touching
+    /// fewer documents. `OnceLock` rather than a `Mutex`: reads from many
+    /// concurrent searches never block each other once the slot is filled.
+    numeric_cache: Vec<OnceLock<Option<NumericColumn>>>,
+    keyword_cache: Vec<OnceLock<Option<KeywordColumn>>>,
 }
 
 /// Map a whole file. Used for `.post`/`.col`/`.doc`, whose own headers (read
@@ -103,7 +117,22 @@ impl SegmentReader {
             )));
         }
 
-        Ok(SegmentReader { terms, ids, post, post_header, col, col_header, doc, doc_header })
+        let num_fields = schema.fields.len();
+        let numeric_cache = std::iter::repeat_with(OnceLock::new).take(num_fields).collect();
+        let keyword_cache = std::iter::repeat_with(OnceLock::new).take(num_fields).collect();
+
+        Ok(SegmentReader {
+            terms,
+            ids,
+            post,
+            post_header,
+            col,
+            col_header,
+            doc,
+            doc_header,
+            numeric_cache,
+            keyword_cache,
+        })
     }
 
     /// Segment-local id resolution, mirroring `MemTable::lookup`. Not part of
@@ -157,23 +186,31 @@ impl IndexSource for SegmentReader {
     }
 
     fn numeric_column(&self, field: FieldId) -> Option<Cow<'_, NumericColumn>> {
-        match codec::decode_numeric_column(&self.col, &self.col_header, field) {
-            Ok(col) => col.map(Cow::Owned),
-            Err(e) => {
-                tracing::warn!(field, error = %e, "segment: failed to decode numeric column");
-                None
+        let slot = self.numeric_cache.get(field as usize)?;
+        let cached = slot.get_or_init(|| {
+            match codec::decode_numeric_column(&self.col, &self.col_header, field) {
+                Ok(col) => col,
+                Err(e) => {
+                    tracing::warn!(field, error = %e, "segment: failed to decode numeric column");
+                    None
+                }
             }
-        }
+        });
+        cached.as_ref().map(Cow::Borrowed)
     }
 
     fn keyword_column(&self, field: FieldId) -> Option<Cow<'_, KeywordColumn>> {
-        match codec::decode_keyword_column(&self.col, &self.col_header, field) {
-            Ok(col) => col.map(Cow::Owned),
-            Err(e) => {
-                tracing::warn!(field, error = %e, "segment: failed to decode keyword column");
-                None
+        let slot = self.keyword_cache.get(field as usize)?;
+        let cached = slot.get_or_init(|| {
+            match codec::decode_keyword_column(&self.col, &self.col_header, field) {
+                Ok(col) => col,
+                Err(e) => {
+                    tracing::warn!(field, error = %e, "segment: failed to decode keyword column");
+                    None
+                }
             }
-        }
+        });
+        cached.as_ref().map(Cow::Borrowed)
     }
 
     fn posting_cursor(&self, term: &str, field: FieldId) -> Option<Box<dyn PostingCursor + '_>> {
@@ -210,6 +247,25 @@ impl IndexSource for SegmentReader {
     }
 
     fn live_doc_freq(&self, term: &str, field: FieldId, deleted: &RoaringBitmap) -> u64 {
+        // Fast path: if nothing in this segment's own doc id range has been
+        // deleted since it was flushed — no internal holes, and no
+        // collection-wide tombstone falls inside its range either — every
+        // posting the stored `doc_freq` counts is genuinely live, so the
+        // count can be read directly instead of decoded and filtered.
+        // Autocomplete calls this for dozens of candidate terms per
+        // keystroke, across every field and every segment, so turning the
+        // common case (a collection with few or no deletes) from O(doc_freq)
+        // into O(1) matters even though it changes no result.
+        let no_holes =
+            self.doc_header.presence.len() == (self.doc_header.end - self.doc_header.base) as u64;
+        let untouched_by_tombstones = match (deleted.min(), deleted.max()) {
+            (Some(lo), Some(hi)) => hi < self.doc_header.base || lo >= self.doc_header.end,
+            _ => true,
+        };
+        if no_holes && untouched_by_tombstones {
+            return self.doc_freq(term, field) as u64;
+        }
+
         let Some(term_id) = self.terms.get(term) else { return 0 };
         match codec::decode_term_field_doc_ids(&self.post, &self.post_header, term_id, field) {
             Ok(doc_ids) => doc_ids
@@ -438,6 +494,40 @@ mod tests {
         assert_eq!(brand.equals("Logitech").iter().collect::<Vec<_>>(), vec![0]);
         let price = seg.numeric_column(3).unwrap();
         assert_eq!(price.range(Some(NumKey::Int(1999)), Some(NumKey::Int(2999))).len(), 2);
+    }
+
+    #[test]
+    fn live_doc_freq_fast_path_agrees_with_the_slow_path() {
+        // A segment with no holes at all (nothing was deleted before this
+        // flush), so `live_doc_freq`'s O(1) stored-count fast path applies —
+        // verify it agrees with what the full decode-and-filter walk would
+        // produce, and that a tombstone landing outside vs. inside this
+        // segment's own doc id range correctly selects the fast path only
+        // when it's actually safe to.
+        let schema = schema();
+        let mut m = MemTable::new(0, &schema);
+        m.insert(doc("1", "wireless mouse", &["red", "blue"], "Logitech", 2999));
+        m.insert(doc("2", "mouse pad", &["blue"], "Razer", 1999));
+        let dir = tempfile::tempdir().unwrap();
+        let encoded = super::super::encode(&m, &schema).unwrap();
+        let paths = write_segment(dir.path(), &encoded);
+        let reader = SegmentReader::open(&paths, &schema).unwrap();
+
+        // Fast path: no tombstones at all.
+        assert_eq!(reader.live_doc_freq("mouse", 0, &RoaringBitmap::new()), 2);
+
+        // Fast path: a tombstone exists, but outside this segment's own doc
+        // id range — must not affect the count.
+        let far_tombstone = RoaringBitmap::from_iter([1000u32]);
+        assert_eq!(reader.live_doc_freq("mouse", 0, &far_tombstone), 2);
+
+        // Fallback: a tombstone lands inside the segment's range — the fast
+        // path's preconditions no longer hold, so this must take the
+        // decode-and-filter path and still produce the reduced, correct
+        // count.
+        let doc0 = reader.lookup_id("1").unwrap();
+        let near_tombstone = RoaringBitmap::from_iter([doc0]);
+        assert_eq!(reader.live_doc_freq("mouse", 0, &near_tombstone), 1);
     }
 
     #[test]
