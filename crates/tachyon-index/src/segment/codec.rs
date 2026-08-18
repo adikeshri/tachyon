@@ -400,14 +400,29 @@ pub(crate) fn decode_block_skeleton(bytes: &[u8], meta: &BlockMeta) -> Result<Bl
 /// One document's positions, decoded on demand from an offset
 /// [`decode_block_skeleton`] already located.
 pub(crate) fn decode_positions_at(bytes: &[u8], offset: u64, tf: u32) -> Result<Vec<u32>> {
+    let mut positions = Vec::with_capacity(tf as usize);
+    decode_positions_into(bytes, offset, tf, &mut positions)?;
+    Ok(positions)
+}
+
+/// Same decode as [`decode_positions_at`], appending into a caller-owned,
+/// reused buffer instead of allocating a fresh `Vec` per call — the shape a
+/// hot query-time caller wants, since a broad query decodes positions for
+/// many (document, token) pairs per search.
+pub(crate) fn decode_positions_into(
+    bytes: &[u8],
+    offset: u64,
+    tf: u32,
+    out: &mut Vec<u32>,
+) -> Result<()> {
     let what = POST_BLOCK_WHAT;
     let slice = bytes_at(bytes, offset as usize, tf as usize * 4, what)?;
     let mut cur = Cursor::new(slice, what);
-    let mut positions = Vec::with_capacity(tf as usize);
+    out.reserve(tf as usize);
     for _ in 0..tf {
-        positions.push(cur.read_u32()?);
+        out.push(cur.read_u32()?);
     }
-    Ok(positions)
+    Ok(())
 }
 
 /// Just the document ids one term occurs in, for one field — no positions

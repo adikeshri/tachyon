@@ -97,19 +97,20 @@ impl FieldCandidates<'_> {
         min
     }
 
-    /// This token's resolved match in this field at `doc_id`, or `None` if
-    /// no candidate is present there. See this module's doc comment for the
-    /// exact multi-candidate aggregation rule this implements.
-    fn resolve(
+    /// This token's BM25 contribution and edit distance in this field at
+    /// `doc_id`, written into `slot` — never touches positions, so this is
+    /// cheap enough to run for every visited document regardless of whether
+    /// it ends up scored. See this module's doc comment for the exact
+    /// multi-candidate aggregation rule this implements.
+    fn resolve_contribution_into(
         &self,
         doc_id: DocId,
         field_len: u32,
         stats: FieldStats,
-        needs_positions: bool,
-    ) -> Option<FieldMatch> {
+        slot: &mut MatchSlot,
+    ) {
         let mut best_contribution = 0.0f32;
         let mut best_edits = u32::MAX;
-        let mut positions = Vec::new();
         let mut matched = false;
 
         for c in &self.candidates {
@@ -124,16 +125,24 @@ impl FieldCandidates<'_> {
             if c.edits < best_edits {
                 best_edits = c.edits;
             }
-            if needs_positions {
-                positions.extend(c.cursor.positions());
-            }
         }
 
-        matched.then_some(FieldMatch {
-            contribution: best_contribution,
-            edits: best_edits,
-            positions,
-        })
+        slot.matched = matched;
+        slot.contribution = best_contribution;
+        slot.edits = best_edits;
+    }
+
+    /// This token's positions in this field at `doc_id`, appended into
+    /// `out` — the union across every matching candidate, same rule as
+    /// [`Self::resolve_contribution_into`]. Called only for documents that
+    /// actually need scoring (or phrase verification), never for one a bound
+    /// already proved isn't worth the decode.
+    fn positions_into(&self, doc_id: DocId, out: &mut Vec<u32>) {
+        for c in &self.candidates {
+            if c.cursor.doc_id() == Some(doc_id) {
+                c.cursor.positions_into(out);
+            }
+        }
     }
 }
 
@@ -141,11 +150,24 @@ impl FieldCandidates<'_> {
 /// the pruning driver operates on, one per token.
 pub(crate) struct TokenFrontier<'a> {
     fields: Vec<FieldCandidates<'a>>,
+    /// Cached result of the multi-field, multi-candidate `min` walk below,
+    /// kept in sync by [`Self::recompute`] on every `advance`/`advance_to`
+    /// rather than recomputed on read. Both drivers read a frontier's
+    /// current doc id several times per document visited (building the
+    /// pivot list, sorting it, checking the pivot, advancing matched
+    /// cursors) without the frontier moving in between, so caching turns
+    /// most of those into a field read instead of a fan-out over `dyn
+    /// PostingCursor`s several layers deep.
+    current: Option<DocId>,
 }
 
 impl TokenFrontier<'_> {
     fn doc_id(&self) -> Option<DocId> {
-        self.fields.iter().filter_map(FieldCandidates::doc_id).min()
+        self.current
+    }
+
+    fn recompute(&mut self) {
+        self.current = self.fields.iter().filter_map(FieldCandidates::doc_id).min();
     }
 
     /// Max-over-fields of each field's bound: only one field ultimately
@@ -176,7 +198,7 @@ impl TokenFrontier<'_> {
     /// Advance every candidate, in every field, currently sitting at this
     /// frontier's own current (smallest) doc id.
     fn advance(&mut self) {
-        let Some(current) = self.doc_id() else { return };
+        let Some(current) = self.current else { return };
         for f in &mut self.fields {
             for c in &mut f.candidates {
                 if c.cursor.doc_id() == Some(current) {
@@ -184,6 +206,7 @@ impl TokenFrontier<'_> {
                 }
             }
         }
+        self.recompute();
     }
 
     fn advance_to(&mut self, target: DocId) {
@@ -194,6 +217,7 @@ impl TokenFrontier<'_> {
                 }
             }
         }
+        self.recompute();
     }
 }
 
@@ -240,8 +264,9 @@ pub(crate) fn build_frontiers<'a>(
                     }
                     FieldCandidates { candidates: field_candidates }
                 })
-                .collect();
-            TokenFrontier { fields }
+                .collect::<Vec<FieldCandidates<'a>>>();
+            let current = fields.iter().filter_map(FieldCandidates::doc_id).min();
+            TokenFrontier { fields, current }
         })
         .collect()
 }
@@ -263,10 +288,15 @@ fn bound_to_combined_score(bm25_bound: f32, scorer: &DocScorer) -> f32 {
     .combine(&scorer.weights)
 }
 
-/// One matched (token, field) cell: the winning candidate's contribution and
-/// edit distance, and the union of every matching candidate's positions —
-/// see this module's doc comment for the exact aggregation rule.
-struct FieldMatch {
+/// One (token, field) cell's evidence: the winning candidate's contribution
+/// and edit distance, and the union of every matching candidate's
+/// positions — see this module's doc comment for the exact aggregation rule.
+/// `positions` keeps its heap allocation across documents (cleared, not
+/// dropped, by [`DocEvidence::reset`]) since a broad query resolves this slot
+/// for hundreds of thousands of documents in one search.
+#[derive(Default)]
+struct MatchSlot {
+    matched: bool,
     contribution: f32,
     edits: u32,
     positions: Vec<u32>,
@@ -276,32 +306,74 @@ struct FieldMatch {
 /// that doc id. Mirrors the retired `Accumulator`'s per-slot API, but for a
 /// single document — the pruning walk visits one document at a time rather
 /// than building a flat table across every match up front.
-struct DocEvidence {
-    /// `[field_pos][token_idx]`.
-    matches: Vec<Vec<Option<FieldMatch>>>,
+///
+/// Owned once per query and reused across every document a driver visits
+/// ([`DocScorer::resolve_contributions`] calls [`DocEvidence::reset`] at the
+/// start of each document) rather than allocated fresh per document: a broad
+/// query can visit hundreds of thousands of documents, and a fresh
+/// `Vec`-of-`Vec`s per document was the largest source of allocator traffic
+/// in the whole query path.
+pub(crate) struct DocEvidence {
+    num_tokens: usize,
+    /// `[field_pos * num_tokens + token_idx]`.
+    slots: Vec<MatchSlot>,
 }
 
 impl DocEvidence {
+    pub(crate) fn new(num_fields: usize, num_tokens: usize) -> DocEvidence {
+        let mut slots = Vec::with_capacity(num_fields * num_tokens);
+        slots.resize_with(num_fields * num_tokens, MatchSlot::default);
+        DocEvidence { num_tokens, slots }
+    }
+
+    fn slot(&self, field: usize, token: usize) -> &MatchSlot {
+        &self.slots[field * self.num_tokens + token]
+    }
+
+    fn slot_mut(&mut self, field: usize, token: usize) -> &mut MatchSlot {
+        &mut self.slots[field * self.num_tokens + token]
+    }
+
+    /// Clear every slot for a new document, keeping each `positions` `Vec`'s
+    /// heap allocation rather than dropping it.
+    fn reset(&mut self) {
+        for slot in &mut self.slots {
+            slot.matched = false;
+            slot.contribution = 0.0;
+            slot.edits = 0;
+            slot.positions.clear();
+        }
+    }
+
     fn matched(&self, field: usize, token: usize) -> bool {
-        self.matches[field][token].is_some()
+        self.slot(field, token).matched
     }
 
     fn field_bm25(&self, field: usize) -> f32 {
-        self.matches[field].iter().filter_map(|m| m.as_ref()).map(|m| m.contribution).sum()
+        (0..self.num_tokens)
+            .map(|t| self.slot(field, t))
+            .filter(|s| s.matched)
+            .map(|s| s.contribution)
+            .sum()
     }
 
     fn field_edits(&self, field: usize) -> u32 {
-        self.matches[field].iter().filter_map(|m| m.as_ref()).map(|m| m.edits).sum()
+        (0..self.num_tokens)
+            .map(|t| self.slot(field, t))
+            .filter(|s| s.matched)
+            .map(|s| s.edits)
+            .sum()
     }
 
     fn field_matched_tokens(&self, field: usize) -> usize {
-        self.matches[field].iter().filter(|m| m.is_some()).count()
+        (0..self.num_tokens).filter(|&t| self.matched(field, t)).count()
     }
 
     /// Sorted, deduplicated positions of one token in one field. Valid only
-    /// after [`DocEvidence::normalize_positions`].
+    /// after [`DocEvidence::normalize_positions`], and only for a slot
+    /// [`DocScorer::resolve_positions`] actually filled.
     fn token_positions(&self, field: usize, token: usize) -> &[u32] {
-        self.matches[field][token].as_ref().map_or(&[], |m| m.positions.as_slice())
+        &self.slot(field, token).positions
     }
 
     /// Put every position list into sorted, deduplicated form, same as the
@@ -309,12 +381,10 @@ impl DocEvidence {
     /// because one token can expand into several candidates, each
     /// contributing its own occurrences.
     fn normalize_positions(&mut self) {
-        for row in &mut self.matches {
-            for m in row.iter_mut().flatten() {
-                if m.positions.len() > 1 {
-                    m.positions.sort_unstable();
-                    m.positions.dedup();
-                }
+        for slot in &mut self.slots {
+            if slot.positions.len() > 1 {
+                slot.positions.sort_unstable();
+                slot.positions.dedup();
             }
         }
     }
@@ -371,39 +441,70 @@ impl<'a> DocScorer<'a> {
         }
     }
 
-    /// Resolve every token's frontier at `doc_id` into one document's
-    /// evidence. Positions are decoded only for candidates actually
-    /// present at this exact doc id — never for a block or document a
-    /// driver already decided to skip.
-    fn resolve(&self, frontiers: &[TokenFrontier], doc_id: DocId) -> DocEvidence {
-        let mut matches = Vec::with_capacity(self.req.query_by.len());
+    /// Resolve every token's frontier at `doc_id` into `evidence`'s BM25
+    /// contributions and edit distances — never positions, which is what
+    /// makes this cheap enough to run for every document a driver visits,
+    /// before the pruning bound check decides whether the (far more
+    /// expensive) position decode is even worth doing. Overwrites whatever
+    /// `evidence` held for the previous document via [`DocEvidence::reset`].
+    fn resolve_contributions(
+        &self,
+        frontiers: &[TokenFrontier],
+        doc_id: DocId,
+        evidence: &mut DocEvidence,
+    ) {
+        evidence.reset();
         for (field_pos, &(field, _boost)) in self.req.query_by.iter().enumerate() {
             let field_len = self.ctx.field_len(doc_id, field);
             let stats = self.field_stats[field_pos];
-            let row: Vec<Option<FieldMatch>> = frontiers
-                .iter()
-                .map(|frontier| {
-                    frontier.fields[field_pos].resolve(
-                        doc_id,
-                        field_len,
-                        stats,
-                        self.needs_positions,
-                    )
-                })
-                .collect();
-            matches.push(row);
+            for (token_idx, frontier) in frontiers.iter().enumerate() {
+                let slot = evidence.slot_mut(field_pos, token_idx);
+                frontier.fields[field_pos]
+                    .resolve_contribution_into(doc_id, field_len, stats, slot);
+            }
         }
-        let mut evidence = DocEvidence { matches };
+    }
+
+    /// The BM25 bound `evidence`'s already-resolved contributions imply:
+    /// the real (not merely bounded) score a document would get if scored
+    /// right now, maxed over fields. Real because `resolve_contributions`
+    /// computed an exact contribution per matched candidate — it just
+    /// skipped positions, which proximity (not BM25) needs.
+    fn bm25_from_contributions(&self, evidence: &DocEvidence) -> f32 {
+        (0..self.req.query_by.len()).map(|f| evidence.field_bm25(f)).fold(0.0f32, f32::max)
+    }
+
+    /// Fill in `evidence`'s positions for every slot [`Self::resolve_contributions`]
+    /// found a match in — called only for a document that survived the bound
+    /// check (or that a phrase query must inspect regardless of pruning). A
+    /// document a bound proves unnecessary to score in full never reaches
+    /// this call, which is the entire latency win of splitting resolution
+    /// into two passes.
+    fn resolve_positions(
+        &self,
+        frontiers: &[TokenFrontier],
+        doc_id: DocId,
+        evidence: &mut DocEvidence,
+    ) {
+        for field_pos in 0..self.req.query_by.len() {
+            for (token_idx, frontier) in frontiers.iter().enumerate() {
+                let slot = evidence.slot_mut(field_pos, token_idx);
+                if !slot.matched {
+                    continue;
+                }
+                frontier.fields[field_pos].positions_into(doc_id, &mut slot.positions);
+            }
+        }
         evidence.normalize_positions();
-        evidence
     }
 
     /// The old `finish()`'s per-slot scoring body, unchanged in substance:
     /// best-field selection, proximity, popularity, `combine()`, and a push
-    /// into the kept set — still gated by the older *scoped* mechanism's
-    /// own exact-bm25-bound check, which this preserves verbatim as an
-    /// inner layer beneath the driver's own (block-level, bound-only)
-    /// pruning.
+    /// into the kept set. The bound check that used to open this function
+    /// now runs in the caller (`visit_and_score`), *before* positions are
+    /// decoded — moving it earlier is the whole point of the two-pass split
+    /// above, so by the time `score` runs, the document is already known to
+    /// be worth fully scoring.
     fn score(
         &self,
         doc_id: DocId,
@@ -412,17 +513,6 @@ impl<'a> DocScorer<'a> {
         candidates: &mut Vec<Ranked>,
     ) {
         let num_fields = self.req.query_by.len();
-        let bm25_bound = (0..num_fields).map(|f| evidence.field_bm25(f)).fold(0.0f32, f32::max);
-
-        if let Some(tk) = top_k.as_ref() {
-            if let Some(threshold) = tk.threshold() {
-                if bound_to_combined_score(bm25_bound, self) < threshold {
-                    // Provably cannot beat the current worst-of-the-kept-set;
-                    // already counted by the caller.
-                    return;
-                }
-            }
-        }
 
         let mut best_field = 0usize;
         let mut best_bm25 = 0.0f32;
@@ -528,6 +618,7 @@ fn visit_and_score(
     frontiers: &[TokenFrontier],
     query: &ParsedQuery,
     scorer: &DocScorer,
+    evidence: &mut DocEvidence,
     matched_ids: &mut Vec<DocId>,
     top_k: &mut Option<TopKByScore>,
     candidates: &mut Vec<Ranked>,
@@ -536,10 +627,19 @@ fn visit_and_score(
         return;
     }
 
-    let evidence = scorer.resolve(frontiers, doc_id);
+    // Pass 1: contributions only — cheap enough to pay for every visited
+    // document, including ones about to be pruned.
+    scorer.resolve_contributions(frontiers, doc_id, evidence);
 
-    if !query.phrases.is_empty() && !satisfies_phrases(&evidence, scorer.req, &query.phrases) {
-        return;
+    let has_phrase = !query.phrases.is_empty();
+    if has_phrase {
+        // A phrase gates whether the document counts as a match at all, so
+        // positions have to be decoded regardless of pruning — there is no
+        // bound to check first.
+        scorer.resolve_positions(frontiers, doc_id, evidence);
+        if !satisfies_phrases(evidence, scorer.req, &query.phrases) {
+            return;
+        }
     }
 
     matched_ids.push(doc_id);
@@ -547,7 +647,25 @@ fn visit_and_score(
         return;
     }
 
-    scorer.score(doc_id, &evidence, top_k, candidates);
+    // Pass 2's bound check, run BEFORE positions are decoded for scoring:
+    // the same score-bound comparison `score()` used to open with, just
+    // moved ahead of the expensive decode it used to gate. A document that
+    // cannot beat the current worst-of-the-kept-set never pays for its
+    // positions at all.
+    if let Some(tk) = top_k.as_ref() {
+        if let Some(threshold) = tk.threshold() {
+            let bm25_bound = scorer.bm25_from_contributions(evidence);
+            if bound_to_combined_score(bm25_bound, scorer) < threshold {
+                return;
+            }
+        }
+    }
+
+    if !has_phrase && scorer.needs_positions {
+        scorer.resolve_positions(frontiers, doc_id, evidence);
+    }
+
+    scorer.score(doc_id, evidence, top_k, candidates);
 }
 
 /// `MatchMode::Any`: a document qualifies as soon as ANY one token's
@@ -562,15 +680,20 @@ pub(crate) fn run_disjunctive(
     frontiers: &mut [TokenFrontier],
     query: &ParsedQuery,
     scorer: &DocScorer,
+    evidence: &mut DocEvidence,
     top_k: &mut Option<TopKByScore>,
     candidates: &mut Vec<Ranked>,
 ) -> (Vec<DocId>, bool) {
     let mut matched_ids = Vec::new();
     let mut any_skip = false;
+    // Reused across iterations rather than collected fresh each time — this
+    // loop runs once per matched document, and a broad query matches a lot
+    // of them.
+    let mut live: Vec<usize> = Vec::with_capacity(frontiers.len());
 
     loop {
-        let mut live: Vec<usize> =
-            (0..frontiers.len()).filter(|&i| frontiers[i].doc_id().is_some()).collect();
+        live.clear();
+        live.extend((0..frontiers.len()).filter(|&i| frontiers[i].doc_id().is_some()));
         if live.is_empty() {
             break;
         }
@@ -603,6 +726,7 @@ pub(crate) fn run_disjunctive(
                     frontiers,
                     query,
                     scorer,
+                    evidence,
                     &mut matched_ids,
                     top_k,
                     candidates,
@@ -664,6 +788,7 @@ pub(crate) fn run_conjunctive(
     frontiers: &mut [TokenFrontier],
     query: &ParsedQuery,
     scorer: &DocScorer,
+    evidence: &mut DocEvidence,
     top_k: &mut Option<TopKByScore>,
     candidates: &mut Vec<Ranked>,
 ) -> (Vec<DocId>, bool) {
@@ -695,7 +820,16 @@ pub(crate) fn run_conjunctive(
         let max_doc = frontiers.iter().map(|f| f.doc_id().unwrap()).max().unwrap();
         if frontiers.iter().all(|f| f.doc_id() == Some(max_doc)) {
             // Genuine match, always counted: this phase alone is exact.
-            visit_and_score(max_doc, frontiers, query, scorer, &mut matched_ids, top_k, candidates);
+            visit_and_score(
+                max_doc,
+                frontiers,
+                query,
+                scorer,
+                evidence,
+                &mut matched_ids,
+                top_k,
+                candidates,
+            );
             for f in frontiers.iter_mut() {
                 f.advance();
             }
@@ -786,14 +920,25 @@ mod tests {
         let scorer = DocScorer::new(&ctx, &req, None, 0, needs_positions, query.tokens.len());
         let mut top_k = Some(TopKByScore::new(req.window()));
         let mut candidates = Vec::new();
+        let mut evidence = DocEvidence::new(req.query_by.len(), query.tokens.len());
 
         let (matched_ids, any_skip) = match mode {
-            MatchMode::Any => {
-                run_disjunctive(&mut frontiers, &query, &scorer, &mut top_k, &mut candidates)
-            }
-            MatchMode::All => {
-                run_conjunctive(&mut frontiers, &query, &scorer, &mut top_k, &mut candidates)
-            }
+            MatchMode::Any => run_disjunctive(
+                &mut frontiers,
+                &query,
+                &scorer,
+                &mut evidence,
+                &mut top_k,
+                &mut candidates,
+            ),
+            MatchMode::All => run_conjunctive(
+                &mut frontiers,
+                &query,
+                &scorer,
+                &mut evidence,
+                &mut top_k,
+                &mut candidates,
+            ),
         };
 
         Outcome { matched_ids, any_skip, hits: top_k.map_or(candidates, TopKByScore::into_vec) }

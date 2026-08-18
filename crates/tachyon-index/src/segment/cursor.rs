@@ -78,6 +78,18 @@ impl PostingCursor for SegmentPostingCursor<'_> {
         })
     }
 
+    fn positions_into(&self, out: &mut Vec<u32>) {
+        let Some(skeleton) = &self.skeleton else { return };
+        let (Some(&offset), Some(&tf)) =
+            (skeleton.positions_offsets.get(self.doc_idx), skeleton.tfs.get(self.doc_idx))
+        else {
+            return;
+        };
+        if let Err(e) = codec::decode_positions_into(self.bytes, offset, tf, out) {
+            tracing::warn!(error = %e, "segment: failed to decode posting positions");
+        }
+    }
+
     fn advance(&mut self) -> Option<DocId> {
         let len = self.skeleton.as_ref().map_or(0, |s| s.doc_ids.len());
         if self.doc_idx + 1 < len {

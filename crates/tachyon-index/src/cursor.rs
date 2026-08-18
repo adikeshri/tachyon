@@ -30,6 +30,17 @@ pub trait PostingCursor {
     /// bound proves unnecessary to visit never pays this cost.
     fn positions(&self) -> Vec<u32>;
 
+    /// Append the current doc id's positions into `out`, without an
+    /// intermediate allocation. Same data as [`PostingCursor::positions`];
+    /// override this when the underlying storage can write directly into
+    /// `out` instead of allocating and handing back a fresh `Vec` — a broad
+    /// query resolves this once per (matched document, matched token), so
+    /// the allocation `positions()` pays for its return value is real cost
+    /// at scale.
+    fn positions_into(&self, out: &mut Vec<u32>) {
+        out.extend_from_slice(&self.positions());
+    }
+
     /// Move to the next doc id.
     fn advance(&mut self) -> Option<DocId>;
 
@@ -75,6 +86,12 @@ impl PostingCursor for MemTablePostingCursor<'_> {
 
     fn positions(&self) -> Vec<u32> {
         self.docs.get(self.pos).map_or_else(Vec::new, |d| d.positions.clone())
+    }
+
+    fn positions_into(&self, out: &mut Vec<u32>) {
+        if let Some(d) = self.docs.get(self.pos) {
+            out.extend_from_slice(&d.positions);
+        }
     }
 
     fn advance(&mut self) -> Option<DocId> {
@@ -143,6 +160,12 @@ impl PostingCursor for MergeCursor<'_> {
 
     fn positions(&self) -> Vec<u32> {
         self.current.map_or_else(Vec::new, |i| self.children[i].positions())
+    }
+
+    fn positions_into(&self, out: &mut Vec<u32>) {
+        if let Some(i) = self.current {
+            self.children[i].positions_into(out);
+        }
     }
 
     fn advance(&mut self) -> Option<DocId> {

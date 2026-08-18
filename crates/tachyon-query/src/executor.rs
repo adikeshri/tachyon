@@ -31,6 +31,7 @@
 //! same match rather than a blend of unrelated ones.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -59,6 +60,16 @@ pub struct SearchContext<'a> {
     pub sources: Vec<&'a dyn IndexSource>,
     /// Collection-wide tombstones, covering documents inside segments.
     pub deleted: &'a RoaringBitmap,
+    /// Index into `sources` that most recently answered a `value`/
+    /// `field_len`/`is_live` lookup. Both WAND drivers visit doc ids in
+    /// strictly ascending order and a source owns a contiguous, disjoint
+    /// range, so consecutive lookups overwhelmingly land on the same source
+    /// many documents in a row; checking it first turns that common case
+    /// into one dyn-dispatched range check instead of scanning every source
+    /// from the top. A miss always falls through to the full scan below, so
+    /// this can only change how fast the common case resolves, never which
+    /// source ends up answering a lookup.
+    source_hint: Cell<usize>,
 }
 
 impl<'a> SearchContext<'a> {
@@ -67,7 +78,7 @@ impl<'a> SearchContext<'a> {
         sources: Vec<&'a dyn IndexSource>,
         deleted: &'a RoaringBitmap,
     ) -> Self {
-        SearchContext { schema, sources, deleted }
+        SearchContext { schema, sources, deleted, source_hint: Cell::new(0) }
     }
 
     /// Corpus statistics for a field, summed across every source. BM25 needs
@@ -92,19 +103,42 @@ impl<'a> SearchContext<'a> {
     /// whenever one turns out not to actually hold `doc_id` live, rather
     /// than trusting the first (possibly hole-only) match.
     pub(crate) fn value(&self, doc_id: DocId, field: FieldId) -> Option<Cow<'a, Value>> {
-        self.sources.iter().find_map(|s| {
-            (doc_id >= s.min_doc_id() && doc_id < s.end_doc_id()).then(|| s.value(doc_id, field))?
-        })
+        let hint = self.source_hint.get();
+        if let Some(s) = self.sources.get(hint) {
+            if doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() {
+                if let Some(v) = s.value(doc_id, field) {
+                    return Some(v);
+                }
+            }
+        }
+        for (i, s) in self.sources.iter().enumerate() {
+            if doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() {
+                if let Some(v) = s.value(doc_id, field) {
+                    self.source_hint.set(i);
+                    return Some(v);
+                }
+            }
+        }
+        None
     }
 
     /// The owning source's own `field_len`, or `0` if no source actually
     /// holds this doc id live. See `Self::value`'s doc comment for why a
     /// range match alone isn't enough to stop the search.
     pub(crate) fn field_len(&self, doc_id: DocId, field: FieldId) -> u32 {
-        self.sources
-            .iter()
-            .find(|s| doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id))
-            .map_or(0, |s| s.field_len(doc_id, field))
+        let hint = self.source_hint.get();
+        if let Some(s) = self.sources.get(hint) {
+            if doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id) {
+                return s.field_len(doc_id, field);
+            }
+        }
+        for (i, s) in self.sources.iter().enumerate() {
+            if doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id) {
+                self.source_hint.set(i);
+                return s.field_len(doc_id, field);
+            }
+        }
+        0
     }
 
     /// Whether `doc_id` is live in whichever source actually holds it, and
@@ -113,10 +147,22 @@ impl<'a> SearchContext<'a> {
     /// here it runs once per document actually reached by a driver. See
     /// `Self::value`'s doc comment for why a range match alone isn't enough.
     pub(crate) fn is_live(&self, doc_id: DocId) -> bool {
-        self.sources
-            .iter()
-            .any(|s| doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id))
-            && !self.deleted.contains(doc_id)
+        if self.deleted.contains(doc_id) {
+            return false;
+        }
+        let hint = self.source_hint.get();
+        if let Some(s) = self.sources.get(hint) {
+            if doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id) {
+                return true;
+            }
+        }
+        for (i, s) in self.sources.iter().enumerate() {
+            if doc_id >= s.min_doc_id() && doc_id < s.end_doc_id() && s.is_live(doc_id) {
+                self.source_hint.set(i);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -208,14 +254,27 @@ pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
         wand::DocScorer::new(ctx, req, filter, allowed_edits, needs_positions, tokens.len());
     let mut top_k = prunable.then(|| TopKByScore::new(req.window()));
     let mut candidates: Vec<Ranked> = Vec::new(); // used only when `top_k` is None
+                                                  // One scratch buffer, reused for every document either driver visits —
+                                                  // see `wand::DocEvidence`'s doc comment for why this matters.
+    let mut evidence = wand::DocEvidence::new(req.query_by.len(), tokens.len());
 
     let (matched_ids, any_skip) = match req.match_mode {
-        MatchMode::Any => {
-            wand::run_disjunctive(&mut frontiers, &query, &scorer, &mut top_k, &mut candidates)
-        }
-        MatchMode::All => {
-            wand::run_conjunctive(&mut frontiers, &query, &scorer, &mut top_k, &mut candidates)
-        }
+        MatchMode::Any => wand::run_disjunctive(
+            &mut frontiers,
+            &query,
+            &scorer,
+            &mut evidence,
+            &mut top_k,
+            &mut candidates,
+        ),
+        MatchMode::All => wand::run_conjunctive(
+            &mut frontiers,
+            &query,
+            &scorer,
+            &mut evidence,
+            &mut top_k,
+            &mut candidates,
+        ),
     };
 
     // Both drivers visit doc ids in strictly ascending order (`MergeCursor`

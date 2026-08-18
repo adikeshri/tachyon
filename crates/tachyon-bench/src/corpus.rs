@@ -118,6 +118,20 @@ pub const BRANDS: &[&str] = &[
 pub const CATEGORIES: &[&str] =
     &["peripherals", "audio", "power", "display", "accessories", "storage"];
 
+/// Distinct adjective/noun variants generated when `--vocab-scale` widens the
+/// vocabulary beyond the base word lists. `1` reproduces the original
+/// 15x15-word corpus exactly (every query matches a wide swath of the
+/// collection, deliberately, per the module doc); higher values multiply the
+/// term count by suffixing each base word with a bucket number, spreading
+/// matches thinner the way a real catalogue's long tail does.
+fn vocab_word(base: &str, rng: &mut Rng, scale: usize) -> String {
+    if scale <= 1 {
+        return base.to_string();
+    }
+    let bucket = rng.zipfish(scale);
+    format!("{base}{bucket}")
+}
+
 /// The benchmark schema: the PRD §7.1 example, widened enough to exercise
 /// filters, sorting, and facets at once.
 pub fn schema(name: &str) -> CollectionSchema {
@@ -135,10 +149,11 @@ pub fn schema(name: &str) -> CollectionSchema {
     )
 }
 
-/// Generate one document.
-pub fn document(rng: &mut Rng, id: usize) -> Value {
-    let adjective = ADJECTIVES[rng.zipfish(ADJECTIVES.len())];
-    let noun = NOUNS[rng.zipfish(NOUNS.len())];
+/// Generate one document. `vocab_scale` widens the term count as described on
+/// [`vocab_word`]; pass `1` to reproduce the original fixed vocabulary.
+pub fn document(rng: &mut Rng, id: usize, vocab_scale: usize) -> Value {
+    let adjective = vocab_word(ADJECTIVES[rng.zipfish(ADJECTIVES.len())], rng, vocab_scale);
+    let noun = vocab_word(NOUNS[rng.zipfish(NOUNS.len())], rng, vocab_scale);
     let material = rng.pick(MATERIALS);
     let qualifier = rng.pick(QUALIFIERS);
 
@@ -161,18 +176,19 @@ pub fn document(rng: &mut Rng, id: usize) -> Value {
 }
 
 /// Queries a benchmark should ask: single words, pairs, a phrase, a typo, and
-/// a prefix — the shapes real traffic actually contains.
-pub fn queries(rng: &mut Rng, count: usize) -> Vec<String> {
+/// a prefix — the shapes real traffic actually contains. `vocab_scale`
+/// matches [`document`]'s, so queries land on terms that actually occur.
+pub fn queries(rng: &mut Rng, count: usize, vocab_scale: usize) -> Vec<String> {
     (0..count)
         .map(|i| {
-            let adjective = ADJECTIVES[rng.zipfish(ADJECTIVES.len())];
-            let noun = NOUNS[rng.zipfish(NOUNS.len())];
+            let adjective = vocab_word(ADJECTIVES[rng.zipfish(ADJECTIVES.len())], rng, vocab_scale);
+            let noun = vocab_word(NOUNS[rng.zipfish(NOUNS.len())], rng, vocab_scale);
             match i % 5 {
-                0 => noun.to_string(),
+                0 => noun.clone(),
                 1 => format!("{adjective} {noun}"),
                 2 => format!("\"{adjective} {noun}\""),
                 // A transposed pair of characters, the commonest real typo.
-                3 => transpose(adjective),
+                3 => transpose(&adjective),
                 _ => adjective[..adjective.len().min(4)].to_string(),
             }
         })

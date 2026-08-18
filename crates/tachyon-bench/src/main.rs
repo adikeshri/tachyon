@@ -63,6 +63,47 @@ struct Args {
     /// `--documents` so several flushes happen during one run.
     #[arg(long, default_value_t = 5_000)]
     flush_scenario_max_memtable_docs: usize,
+
+    /// Multiplies the corpus's distinct term count by suffixing each base
+    /// word with a bucket in `0..vocab_scale`. `1` (the default) reproduces
+    /// the original ~64-term corpus, where one query word matches ~6% of the
+    /// collection — deliberately broad, the expensive case. Real catalogues
+    /// look much more like a higher scale: a query term matching a thin
+    /// slice of the corpus rather than a wide swath of it.
+    #[arg(long, default_value_t = 1)]
+    vocab_scale: usize,
+
+    /// Memtable document threshold for the main Indexing/Search sections
+    /// (independent of `--flush-scenario-max-memtable-docs`, which only
+    /// applies to `--flush-scenario`). Defaults to unbounded so the main
+    /// section keeps measuring the index rather than the flush policy, same
+    /// as always — but that also means it never touches `SegmentReader` at
+    /// all: every read comes from the one giant memtable, so anything that
+    /// only pays off for on-disk segments (column caching, block-structured
+    /// postings, the autocomplete fast count) is invisible in the default
+    /// run. Set this below `--documents` to measure the collection the way
+    /// it actually looks in steady state: mostly segments, not one memtable.
+    #[arg(long, default_value_t = usize::MAX)]
+    max_memtable_docs: usize,
+
+    /// Also run a sustained-concurrency scenario: this many threads, each
+    /// continuously issuing plain-query searches against one shared,
+    /// already-indexed collection for `--concurrency-duration-secs`,
+    /// reporting aggregate throughput and mean per-query processing time —
+    /// the same pair Typesense's own published benchmarks report ("N
+    /// concurrent queries per second, average processing time of Xms").
+    /// `Collection::search` takes only a read lock, so this needs no engine
+    /// change to be safe — `--flush-scenario` above already proves the same
+    /// `Arc<Collection>` + multi-thread pattern works. 0 (the default)
+    /// skips this: every section above runs single-threaded, which is the
+    /// quantity that number is NOT, so without this flag nothing in this
+    /// binary's output is directly comparable to it.
+    #[arg(long, default_value_t = 0)]
+    concurrency: usize,
+
+    /// How long `--concurrency` hammers the shared collection.
+    #[arg(long, default_value_t = 10)]
+    concurrency_duration_secs: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,15 +118,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         SyncPolicy::Interval(Duration::from_millis(200))
     });
-    // The whole corpus stays in one memtable so this measures the index, not
-    // the flush policy.
-    let config = config.with_max_memtable_docs(usize::MAX);
+    // Unbounded by default: the whole corpus stays in one memtable so this
+    // measures the index, not the flush policy. Override with
+    // `--max-memtable-docs` to measure against on-disk segments instead.
+    let config = config.with_max_memtable_docs(args.max_memtable_docs);
 
     println!("Tachyon benchmark");
     println!("  documents   {}", args.documents);
     println!("  queries     {}", args.queries);
     println!("  batch size  {}", args.batch_size);
     println!("  fsync       {}", if args.fsync { "every batch" } else { "every 200ms" });
+    println!(
+        "  vocab scale {}  ({})",
+        args.vocab_scale,
+        if args.vocab_scale <= 1 {
+            "fixed ~64-term corpus, deliberately broad matches"
+        } else {
+            "widened vocabulary, thinner matches per term"
+        }
+    );
+    println!(
+        "  max memtable docs  {}",
+        if args.max_memtable_docs == usize::MAX {
+            // Still subject to `max_memtable_bytes` (default 256 MiB), so a
+            // large `--documents` flushes into segments anyway — this only
+            // disables the doc-count trigger, not flushing altogether.
+            "unbounded by doc count (256 MiB byte threshold still applies)".to_string()
+        } else {
+            args.max_memtable_docs.to_string()
+        }
+    );
     println!();
 
     let collection = Collection::create(&layout, corpus::schema("products"), &config)?;
@@ -97,8 +159,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while indexed < args.documents {
         let this_batch = args.batch_size.min(args.documents - indexed);
-        let batch: Vec<_> =
-            (0..this_batch).map(|i| corpus::document(&mut rng, indexed + i)).collect();
+        let batch: Vec<_> = (0..this_batch)
+            .map(|i| corpus::document(&mut rng, indexed + i, args.vocab_scale))
+            .collect();
         let report = collection.upsert_batch(batch)?;
         if report.num_failed > 0 {
             return Err(format!("{} documents failed to index", report.num_failed).into());
@@ -116,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.documents as f64 / index_elapsed.as_secs_f64()
     );
     println!("  documents      {}", stats.num_documents);
+    println!("  segments       {}", stats.num_segments);
     println!("  memtable       {}", human_bytes(stats.memtable_bytes));
     println!("  wal            {}", human_bytes(stats.wal_bytes as usize));
     println!("  bytes/doc      {}", human_bytes(stats.memtable_bytes / args.documents.max(1)));
@@ -127,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Search -----------------------------------------------------------
     let mut rng = Rng::new(args.seed ^ 0x5eed);
-    let queries = corpus::queries(&mut rng, args.queries);
+    let queries = corpus::queries(&mut rng, args.queries, args.vocab_scale);
 
     let plain = measure(&collection, &queries, |q| SearchParams {
         q: Some(q.to_string()),
@@ -179,6 +243,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_flush_scenario(&args)?;
     }
 
+    if args.concurrency > 0 {
+        run_concurrency_scenario(&args)?;
+    }
+
     Ok(())
 }
 
@@ -203,7 +271,7 @@ fn run_flush_scenario(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let collection = Arc::new(Collection::create(&layout, corpus::schema("products"), &config)?);
 
     let mut rng = Rng::new(args.seed ^ 0x5eed);
-    let queries = corpus::queries(&mut rng, args.queries.max(200));
+    let queries = corpus::queries(&mut rng, args.queries.max(200), args.vocab_scale);
 
     let stop = Arc::new(AtomicBool::new(false));
     let latencies = Arc::new(Mutex::new(Vec::<u64>::new()));
@@ -239,8 +307,9 @@ fn run_flush_scenario(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut indexed = 0usize;
     while indexed < args.documents {
         let this_batch = args.batch_size.min(args.documents - indexed);
-        let batch: Vec<_> =
-            (0..this_batch).map(|i| corpus::document(&mut rng, indexed + i)).collect();
+        let batch: Vec<_> = (0..this_batch)
+            .map(|i| corpus::document(&mut rng, indexed + i, args.vocab_scale))
+            .collect();
         let report = collection.upsert_batch(batch)?;
         if report.num_failed > 0 {
             return Err(format!("{} documents failed to index", report.num_failed).into());
@@ -268,6 +337,109 @@ fn run_flush_scenario(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let total_hits = total_hits.load(Ordering::Relaxed);
     let measurement = Measurement { latencies, total_hits };
     report("Search, concurrent with flushing", &measurement, 60.0);
+
+    Ok(())
+}
+
+/// Index a fresh collection, then hammer it with `--concurrency` threads
+/// each running the plain-query workload continuously for
+/// `--concurrency-duration-secs`, and report aggregate throughput and mean
+/// per-query processing time — the pair Typesense's own benchmarks publish.
+/// `Collection::search` takes only a read lock (see its doc comment), so
+/// many threads calling it concurrently is an already-supported, already-
+/// exercised pattern (`run_flush_scenario` above does the same
+/// `Arc<Collection>` + `thread::spawn` shape); this needed no engine change.
+fn run_concurrency_scenario(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Concurrency scenario");
+    println!("  threads                 {}", args.concurrency);
+    println!("  duration                {}s", args.concurrency_duration_secs);
+    println!();
+
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::new(dir.path());
+    layout.initialize()?;
+    let config = EngineConfig::new(dir.path())
+        .with_sync_policy(SyncPolicy::Interval(Duration::from_millis(200)))
+        .with_max_memtable_docs(args.max_memtable_docs);
+
+    let collection = Arc::new(Collection::create(&layout, corpus::schema("products"), &config)?);
+
+    let mut rng = Rng::new(args.seed);
+    let mut indexed = 0usize;
+    while indexed < args.documents {
+        let this_batch = args.batch_size.min(args.documents - indexed);
+        let batch: Vec<_> = (0..this_batch)
+            .map(|i| corpus::document(&mut rng, indexed + i, args.vocab_scale))
+            .collect();
+        let report = collection.upsert_batch(batch)?;
+        if report.num_failed > 0 {
+            return Err(format!("{} documents failed to index", report.num_failed).into());
+        }
+        indexed += this_batch;
+    }
+    collection.sync()?;
+
+    let mut rng = Rng::new(args.seed ^ 0x5eed);
+    let queries = Arc::new(corpus::queries(&mut rng, args.queries.max(200), args.vocab_scale));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let total_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let latencies: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let started = Instant::now();
+    let mut handles = Vec::with_capacity(args.concurrency);
+    for _ in 0..args.concurrency {
+        let collection = Arc::clone(&collection);
+        let queries = Arc::clone(&queries);
+        let stop = Arc::clone(&stop);
+        let total_queries = Arc::clone(&total_queries);
+        let errors = Arc::clone(&errors);
+        let latencies = Arc::clone(&latencies);
+        handles.push(std::thread::spawn(move || {
+            let mut i = 0usize;
+            let mut local_latencies = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let q = &queries[i % queries.len()];
+                let query_started = Instant::now();
+                match collection.search(SearchParams { q: Some(q.clone()), ..Default::default() }) {
+                    Ok(_) => local_latencies.push(query_started.elapsed().as_micros() as u64),
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                i += 1;
+            }
+            total_queries.fetch_add(local_latencies.len() as u64, Ordering::Relaxed);
+            latencies.lock().expect("latencies mutex poisoned").extend(local_latencies);
+        }));
+    }
+
+    std::thread::sleep(Duration::from_secs(args.concurrency_duration_secs));
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+    let elapsed = started.elapsed();
+
+    let total = total_queries.load(Ordering::Relaxed);
+    let errors = errors.load(Ordering::Relaxed);
+    let qps = total as f64 / elapsed.as_secs_f64();
+    let latencies =
+        Arc::try_unwrap(latencies).expect("every worker thread has joined").into_inner().unwrap();
+    let mean_ms = latencies.iter().sum::<u64>() as f64 / latencies.len().max(1) as f64 / 1000.0;
+
+    println!("  queries completed       {total}");
+    if errors > 0 {
+        println!("  errors                  {errors}  (excluded from latency stats)");
+    }
+    println!("  elapsed                 {:.2}s", elapsed.as_secs_f64());
+    println!(
+        "  throughput              {qps:.1} concurrent queries/sec  \
+         (Typesense reference: 104 @ 4 vCPU / 2.2M docs)"
+    );
+    println!("  mean processing time    {mean_ms:.2} ms  (Typesense reference: 11 ms)");
+    println!();
 
     Ok(())
 }
@@ -312,6 +484,13 @@ fn report(label: &str, measurement: &Measurement, target_p95_ms: f64) {
 
     let p95 = percentile(0.95);
     let mean = sorted.iter().sum::<u64>() as f64 / sorted.len().max(1) as f64 / 1000.0;
+    let mean_hits = measurement.total_hits as f64 / sorted.len().max(1) as f64;
+    // The cost-per-matched-document ratio: latency should be dominated by work
+    // proportional to how many documents a query actually touches, not by
+    // corpus size on its own. Comparing this figure across corpus sizes is
+    // what tells apart "the walk got more expensive" from "the query just
+    // matched more documents" — the two look identical in raw latency alone.
+    let ns_per_hit = if mean_hits > 0.0 { mean * 1_000_000.0 / mean_hits } else { 0.0 };
 
     println!("{label}");
     println!("  queries        {}", sorted.len());
@@ -323,7 +502,8 @@ fn report(label: &str, measurement: &Measurement, target_p95_ms: f64) {
     );
     println!("  p99            {:.2} ms", percentile(0.99));
     println!("  max            {:.2} ms", percentile(1.0));
-    println!("  mean hits      {:.0}", measurement.total_hits as f64 / sorted.len().max(1) as f64);
+    println!("  mean hits      {mean_hits:.0}");
+    println!("  ns/matched doc {ns_per_hit:.0}");
     println!();
 }
 
@@ -336,7 +516,11 @@ fn peak_rss_bytes() -> usize {
         usage.ru_maxrss
     };
     // Linux reports ru_maxrss in KiB; Darwin reports it in bytes.
-    if cfg!(target_os = "linux") { maxrss as usize * 1024 } else { maxrss as usize }
+    if cfg!(target_os = "linux") {
+        maxrss as usize * 1024
+    } else {
+        maxrss as usize
+    }
 }
 
 /// Current resident set size, via `ps` — unlike `peak_rss_bytes`, this can
