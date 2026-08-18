@@ -102,12 +102,12 @@ broader than real traffic, and deliberately so, because it is the expensive case
 
 | | 100k documents | 1M documents | 5M documents | Target |
 |---|---|---|---|---|
-| Search p95 | **4.1 ms** | 51.3 ms | 259.5 ms | < 30 ms |
-| Search p99 | **5.1 ms** | 52.8 ms | 266.8 ms | < 60 ms |
-| Autocomplete p95 | **0.22 ms** | 2.4 ms | 18.3 ms | < 5 ms |
-| Indexing | **221k docs/sec** | 135k docs/sec | 54k docs/sec | 10k docs/sec |
-| Memory (steady RSS) | 406 MiB | 999 MiB | 3.1 GiB | — |
-| Memory (peak RSS) | 406 MiB | 1.0 GiB | 4.1 GiB | — |
+| Search p95 | **3.6 ms** | 31.6 ms | 160.3 ms | < 30 ms |
+| Search p99 | **4.3 ms** | 34.3 ms | 171.5 ms | < 60 ms |
+| Autocomplete p95 | **0.35 ms** | 0.24 ms | 1.4 ms | < 5 ms |
+| Indexing | **182k docs/sec** | 140k docs/sec | 50k docs/sec | 10k docs/sec |
+| Memory (steady RSS) | 403 MiB | 968 MiB | 3.4 GiB | — |
+| Memory (peak RSS) | 403 MiB | 999 MiB | 5.2 GiB | — |
 
 Both measured right after indexing finishes, before any searches run. Steady
 is current RSS at that point — what's resident most of the time. Peak is
@@ -121,9 +121,11 @@ Reproduce:
 cargo run --release -p tachyon-bench -- --documents 1000000 --queries 2000
 ```
 
-Indexing throughput beats the target by more than an order of magnitude.
-Search meets the latency target at 100k documents and misses it at 1M and 5M
-**on this corpus**; see [Known limitations](#known-limitations).
+Indexing throughput beats the target by more than an order of magnitude, and
+autocomplete now clears its target at every scale measured. Search meets the
+latency target at 100k documents; at 1M it misses by a hair (31.6 ms vs. the
+30 ms target) and at 5M it still misses by a wide margin **on this corpus**;
+see [Known limitations](#known-limitations).
 
 ---
 
