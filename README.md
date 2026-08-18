@@ -14,10 +14,8 @@ minutes. It is not a vector database and not a RAG engine; it does one thing.
 docker run -p 8108:8108 ghcr.io/tachyon-search/tachyon:latest
 ```
 
-> **Status: alpha.** The API is stable enough to build against and every
-> feature below is tested end to end, but this has not run in production
-> anywhere. See [Known limitations](#known-limitations) before you rely on it —
-> in particular, **a merge briefly holds everything it's folding together in
+> See [Known limitations](#known-limitations) before you rely on it — in
+> particular, **a merge briefly holds everything it's folding together in
 > memory at once**, a real cost worth accounting for when tuning
 > `--merge-fan-in` on a memory-constrained deployment.
 
@@ -102,23 +100,30 @@ From `cargo run --release -p tachyon-bench`, on an Apple M-series laptop, over a
 synthetic catalogue where a one-word query matches **6% of the corpus** — far
 broader than real traffic, and deliberately so, because it is the expensive case.
 
-| | 100k documents | 1M documents | Target |
-|---|---|---|---|
-| Search p95 | **3.6 ms** | 67.6 ms | < 30 ms |
-| Search p99 | **4.5 ms** | 68.5 ms | < 60 ms |
-| Autocomplete p95 | **0.09 ms** | 0.1 ms | < 5 ms |
-| Indexing | **210k docs/sec** | 161k docs/sec | 10k docs/sec |
-| Memory | 104 MiB | 1.0 GiB | — |
+| | 100k documents | 1M documents | 5M documents | Target |
+|---|---|---|---|---|
+| Search p95 | **4.1 ms** | 51.3 ms | 259.5 ms | < 30 ms |
+| Search p99 | **5.1 ms** | 52.8 ms | 266.8 ms | < 60 ms |
+| Autocomplete p95 | **0.22 ms** | 2.4 ms | 18.3 ms | < 5 ms |
+| Indexing | **221k docs/sec** | 135k docs/sec | 54k docs/sec | 10k docs/sec |
+| Memory (steady RSS) | 406 MiB | 999 MiB | 3.1 GiB | — |
+| Memory (peak RSS) | 406 MiB | 1.0 GiB | 4.1 GiB | — |
+
+Both measured right after indexing finishes, before any searches run. Steady
+is current RSS at that point — what's resident most of the time. Peak is
+`getrusage`'s kernel-tracked high-water mark since process start, which also
+catches any transient spike indexing passed through on the way there; at 5M
+documents the two diverge meaningfully; at 100k they don't.
 
 Reproduce:
 
 ```bash
-cargo run --release -p tachyon-bench -- --documents 1000000 --queries 1000
+cargo run --release -p tachyon-bench -- --documents 1000000 --queries 2000
 ```
 
 Indexing throughput beats the target by more than an order of magnitude.
-Search meets the latency target at 100k documents and misses it at 1M **on this
-corpus**; see [Known limitations](#known-limitations).
+Search meets the latency target at 100k documents and misses it at 1M and 5M
+**on this corpus**; see [Known limitations](#known-limitations).
 
 ---
 

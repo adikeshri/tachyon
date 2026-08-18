@@ -119,6 +119,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  memtable       {}", human_bytes(stats.memtable_bytes));
     println!("  wal            {}", human_bytes(stats.wal_bytes as usize));
     println!("  bytes/doc      {}", human_bytes(stats.memtable_bytes / args.documents.max(1)));
+    println!("  rss (peak)     {}", human_bytes(peak_rss_bytes()));
+    if let Some(rss) = current_rss_bytes() {
+        println!("  rss (steady)   {}", human_bytes(rss));
+    }
     println!();
 
     // --- Search -----------------------------------------------------------
@@ -321,6 +325,27 @@ fn report(label: &str, measurement: &Measurement, target_p95_ms: f64) {
     println!("  max            {:.2} ms", percentile(1.0));
     println!("  mean hits      {:.0}", measurement.total_hits as f64 / sorted.len().max(1) as f64);
     println!();
+}
+
+/// Peak resident set size since process start — a kernel-tracked high-water
+/// mark, so it catches transient spikes a point-in-time sample would miss.
+fn peak_rss_bytes() -> usize {
+    let maxrss = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage.ru_maxrss
+    };
+    // Linux reports ru_maxrss in KiB; Darwin reports it in bytes.
+    if cfg!(target_os = "linux") { maxrss as usize * 1024 } else { maxrss as usize }
+}
+
+/// Current resident set size, via `ps` — unlike `peak_rss_bytes`, this can
+/// fall as well as rise, so it reflects what's actually resident right now
+/// rather than the high-water mark. `None` on platforms without `ps -o rss=`.
+fn current_rss_bytes() -> Option<usize> {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid]).output().ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse::<usize>().ok().map(|kb| kb * 1024)
 }
 
 fn human_bytes(bytes: usize) -> String {
