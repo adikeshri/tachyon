@@ -142,6 +142,16 @@ impl SegmentReader {
         self.terms_get(&self.ids, id)
     }
 
+    /// This segment's own presence bitmap — every doc id it holds a live
+    /// document for, with no holes for anything that was deleted before
+    /// this segment was ever flushed. `tachyon-engine`'s merge path
+    /// intersects this against the collection's own tombstones to get the
+    /// set of ids that should survive a merge; everywhere else, `is_live`
+    /// (one doc id at a time, via [`IndexSource`]) is the right entry point.
+    pub fn presence(&self) -> &RoaringBitmap {
+        &self.doc_header.presence
+    }
+
     fn terms_get(&self, map: &fst::Map<Mmap>, key: &str) -> Option<DocId> {
         map.get(key).map(|v| v as DocId)
     }
@@ -160,6 +170,46 @@ impl SegmentReader {
                 None
             }
         }
+    }
+
+    // --- raw accessors for `super::merge` -----------------------------
+    //
+    // A merge reads several segments' raw bytes directly (term FSTs for a
+    // union walk, block directories for a reblock-and-copy, doc-store
+    // sections for a verbatim byte copy) rather than going through
+    // `IndexSource`'s per-query decode surface, so it needs the mapped bytes
+    // and headers themselves, not just what a search ever asks for.
+
+    pub(crate) fn terms_map(&self) -> &fst::Map<Mmap> {
+        &self.terms
+    }
+
+    pub(crate) fn ids_map(&self) -> &fst::Map<Mmap> {
+        &self.ids
+    }
+
+    pub(crate) fn post_bytes(&self) -> &[u8] {
+        &self.post
+    }
+
+    pub(crate) fn post_header(&self) -> &PostHeader {
+        &self.post_header
+    }
+
+    pub(crate) fn col_bytes(&self) -> &[u8] {
+        &self.col
+    }
+
+    pub(crate) fn col_header(&self) -> &ColHeader {
+        &self.col_header
+    }
+
+    pub(crate) fn doc_bytes(&self) -> &[u8] {
+        &self.doc
+    }
+
+    pub(crate) fn doc_header(&self) -> &DocHeader {
+        &self.doc_header
     }
 }
 

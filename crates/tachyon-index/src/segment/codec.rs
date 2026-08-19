@@ -1,14 +1,35 @@
-//! Segment byte codec, v2: encode a live view of a [`MemTable`] into five
-//! segment blobs, and decode them back — lazily. Nothing here holds a whole
-//! segment's postings, columns, or documents in memory at once; every decode
-//! function here takes the byte slice it needs and returns just the one
-//! term's postings, one field's column, or one document's value the caller
-//! asked for. `tachyon-engine`'s `SegmentReader` wraps these around an mmap'd
-//! file per blob and calls them per query.
+//! Segment byte codec, v4: stream a live view of a [`MemTable`] — or, via
+//! [`super::merge`], several already-encoded segments — into five segment
+//! blobs, and decode them back — lazily. Nothing here holds a whole segment's
+//! postings, columns, or documents in memory at once; every write function
+//! streams forward through an [`impl Write`](std::io::Write) sink, bounded by
+//! at most one term's, one field's, or one document's worth of scratch space
+//! at a time — never by corpus size. Every decode function takes the byte
+//! slice it needs and returns just the one term's postings, one field's
+//! column, or one document's value the caller asked for. `tachyon-engine`'s
+//! `SegmentReader` wraps these around an mmap'd file per blob and calls them
+//! per query.
 //!
-//! No filesystem access here — writing the bytes to disk and committing them
-//! is `tachyon-engine`'s job, per `tachyon-storage`'s "segment *contents* are
-//! the index crate's business, segment *lifecycle* is the engine's" split.
+//! No filesystem access here — opening the destination files, writing them
+//! to disk, and committing them into `state.json` is `tachyon-engine`'s job,
+//! per `tachyon-storage`'s "segment *contents* are the index crate's
+//! business, segment *lifecycle* is the engine's" split.
+//!
+//! # Footer layout
+//!
+//! `.post`, `.col`, and `.doc` all follow the same shape: a 12-byte header,
+//! then payload data written forward as it's produced, then a footer (the
+//! directory a query needs to locate anything — an offset table, a column
+//! directory, a doc-store section table) written last, once its contents are
+//! finally known, and a trailing 8-byte absolute file offset pointing at
+//! where that footer begins. A reader with the whole file mmap'd checks the
+//! header, reads the last 8 bytes to find the footer, and reads the footer
+//! from there — no different in cost from a front-loaded directory, since
+//! mmap makes every byte in the file equally cheap to reach. What it buys is
+//! a writer that never needs to know its own directory's size or contents
+//! before starting to stream payload bytes. `.terms` and `.ids` need no such
+//! footer: both are `fst::Map`s, and `fst::MapBuilder` already streams
+//! directly into a [`Write`](std::io::Write) sink in sorted-key order.
 //!
 //! # Holes
 //!
@@ -20,6 +41,7 @@
 //! policy leaves behind.
 
 use std::collections::HashMap;
+use std::io::Write;
 
 use roaring::RoaringBitmap;
 use serde_json::Value as Json;
@@ -31,12 +53,18 @@ use crate::inverted::DocPosting;
 use crate::memtable::MemTable;
 
 use super::format::{
-    bytes_at, f64_at, i64_at, u32_at, u8_at, write_bytes, write_f64, write_header, write_i64,
-    write_str, write_u32, write_u64, write_u8, Cursor, COL_MAGIC, DOC_MAGIC, HEADER_LEN, IDS_MAGIC,
-    POST_MAGIC, TERMS_MAGIC,
+    bytes_at, f64_at, i64_at, u32_at, u64_at, u8_at, write_bytes, write_f64, write_header,
+    write_i64, write_str, write_u32, write_u64, write_u8, CountingWriter, Cursor, COL_MAGIC,
+    DOC_MAGIC, FOOTER_POINTER_LEN, HEADER_LEN, IDS_MAGIC, POST_MAGIC, TERMS_MAGIC,
 };
 
 /// The five byte blobs one segment is made of, ready to be written to disk.
+/// Exists mainly so `codec`'s own tests (and a couple of tests elsewhere in
+/// this crate that don't need real files) can call [`encode`] and get
+/// something they can slice into directly — `tachyon-engine`'s real flush
+/// and merge paths stream straight into files via
+/// [`encode_streaming`]/[`super::merge::merge_segments`] instead, without
+/// ever materializing a segment's bytes in one buffer.
 pub struct EncodedSegment {
     pub terms: Vec<u8>,
     pub ids: Vec<u8>,
@@ -45,25 +73,43 @@ pub struct EncodedSegment {
     pub doc: Vec<u8>,
 }
 
-/// Encode every live document in `memtable` into segment bytes.
+/// Encode every live document in `memtable` into segment bytes, in memory.
+/// A thin convenience wrapper around [`encode_streaming`] for callers (tests,
+/// mostly) that want an owned blob rather than to stream into files — see
+/// [`EncodedSegment`]'s doc comment.
 pub fn encode(memtable: &MemTable, schema: &CollectionSchema) -> Result<EncodedSegment> {
-    let live: RoaringBitmap = memtable.iter().map(|(id, _)| id).collect();
-
-    let (terms, post) = encode_postings(memtable, &live, schema)?;
-    let ids = encode_ids(memtable)?;
-    let col = encode_columns(memtable, &live, schema);
-    let doc = encode_docs(memtable, schema);
-
+    let mut terms = Vec::new();
+    let mut ids = Vec::new();
+    let mut post = Vec::new();
+    let mut col = Vec::new();
+    let mut doc = Vec::new();
+    encode_streaming(memtable, schema, &mut terms, &mut ids, &mut post, &mut col, &mut doc)?;
     Ok(EncodedSegment { terms, ids, post, col, doc })
 }
 
-/// Wrap the payload of an `fst::Map` (built in memory) with the standard
-/// segment header, so every file — FST-backed or not — starts the same way.
-fn wrap_fst(magic: &[u8; 8], fst_bytes: Vec<u8>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(HEADER_LEN + fst_bytes.len());
-    write_header(&mut buf, magic);
-    buf.extend_from_slice(&fst_bytes);
-    buf
+/// Stream every live document in `memtable` into the five sinks, in bounded
+/// memory: `terms_w`/`ids_w` grow with the FST as `fst::MapBuilder` writes to
+/// them, `post_w` never holds more than one term-field's postings at a time,
+/// `col_w` never holds more than one field's column at a time, and `doc_w`'s
+/// bounded scratch (`field_lengths`/`values_dir`/`source_dir`) is sized by
+/// document count and field count, not by document content. Nothing here
+/// scales with total corpus text or position count.
+pub fn encode_streaming(
+    memtable: &MemTable,
+    schema: &CollectionSchema,
+    terms_w: impl Write,
+    ids_w: impl Write,
+    post_w: impl Write,
+    col_w: impl Write,
+    doc_w: impl Write,
+) -> Result<()> {
+    let live: RoaringBitmap = memtable.iter().map(|(id, _)| id).collect();
+
+    encode_postings_streaming(memtable, &live, schema, terms_w, post_w)?;
+    encode_ids_streaming(memtable, ids_w)?;
+    encode_columns_streaming(memtable, &live, schema, col_w)?;
+    encode_docs_streaming(memtable, schema, doc_w)?;
+    Ok(())
 }
 
 /// Validate a header and return the byte offset where the payload after it
@@ -75,29 +121,57 @@ pub fn validate_header(bytes: &[u8], magic: &[u8; 8], what: &'static str) -> Res
     Ok(cur.position())
 }
 
-// --- ids -------------------------------------------------------------------
+/// The absolute file offset the trailing 8-byte footer pointer names, for a
+/// footer-based file (`.post`/`.col`/`.doc`). `what` labels corruption errors.
+fn read_footer_start(bytes: &[u8], what: &'static str) -> Result<usize> {
+    if bytes.len() < HEADER_LEN + FOOTER_POINTER_LEN {
+        return Err(Error::corruption(format!("{what}: truncated or malformed")));
+    }
+    let footer_start = u64_at(bytes, bytes.len() - FOOTER_POINTER_LEN, what)? as usize;
+    if footer_start < HEADER_LEN || footer_start > bytes.len() - FOOTER_POINTER_LEN {
+        return Err(Error::corruption(format!("{what}: footer pointer out of range")));
+    }
+    Ok(footer_start)
+}
+
+// --- ids ---------------------------------------------------------------
 
 /// `id -> doc_id`, an `fst::Map` exactly like `.terms` — sorted, mmap'd,
 /// nothing resident but the offset of the file itself. Replaces holding a
-/// `HashMap<Box<str>, DocId>` for the whole segment.
-fn encode_ids(memtable: &MemTable) -> Result<Vec<u8>> {
+/// `HashMap<Box<str>, DocId>` for the whole segment. The `(id, doc_id)` pairs
+/// themselves are held as a `Vec` to be sorted before insertion (`fst`
+/// requires ascending-key insertion) — bounded by total id-string bytes,
+/// which is small next to postings or document text and not worth streaming
+/// around.
+fn encode_ids_streaming(memtable: &MemTable, ids_w: impl Write) -> Result<()> {
     let mut pairs: Vec<(&str, DocId)> =
         memtable.iter().map(|(doc_id, doc)| (doc.id.as_str(), doc_id)).collect();
     pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-
-    let mut builder = fst::MapBuilder::memory();
-    for (id, doc_id) in &pairs {
-        builder
-            .insert(id, *doc_id as u64)
-            .map_err(|e| Error::internal(format!("building segment id index: {e}")))?;
-    }
-    let fst_bytes = builder
-        .into_inner()
-        .map_err(|e| Error::internal(format!("building segment id index: {e}")))?;
-    Ok(wrap_fst(IDS_MAGIC, fst_bytes))
+    write_fst(ids_w, IDS_MAGIC, pairs.into_iter().map(|(id, doc_id)| (id, doc_id as u64)))
 }
 
-// --- postings + terms --------------------------------------------------
+/// Write a header followed by an `fst::Map` streamed directly from a sorted
+/// `(key, value)` iterator — used for both `.ids` (id order, pairs already
+/// buffered and sorted by the caller) and `.terms` (dictionary order, driven
+/// term-by-term by the postings writer so the map and the postings it points
+/// into are built in the same pass).
+pub(crate) fn write_fst<'a>(
+    mut w: impl Write,
+    magic: &[u8; 8],
+    pairs: impl Iterator<Item = (&'a str, u64)>,
+) -> Result<()> {
+    write_header(&mut w, magic)?;
+    let mut builder = fst::MapBuilder::new(w)
+        .map_err(|e| Error::internal(format!("building segment id/term index: {e}")))?;
+    for (key, value) in pairs {
+        builder
+            .insert(key, value)
+            .map_err(|e| Error::internal(format!("building segment id/term index: {e}")))?;
+    }
+    builder.finish().map_err(|e| Error::internal(format!("building segment id/term index: {e}")))
+}
+
+// --- postings + terms ----------------------------------------------------
 
 /// Fixed number of docs per posting block: small enough that a block's
 /// `max_tf` tracks the true local maximum closely (a tight bound is what
@@ -106,24 +180,29 @@ fn encode_ids(memtable: &MemTable) -> Result<Vec<u8>> {
 /// 20 bytes ≈ 1.5 KB.
 pub(crate) const POSTING_BLOCK_SIZE: usize = 128;
 
+/// Byte width of one [`BlockMeta`] on disk: `last_doc_id`(4) + `max_tf`(4) +
+/// `offset`(8) + `length`(4).
+const BLOCK_META_LEN: u64 = 20;
+
 /// Fixed-width per-block skip metadata: lets a query decide whether to skip
 /// a block, or jump straight to one, without decoding a single posting
-/// inside it. 20 bytes on disk.
+/// inside it. 20 bytes on disk. `offset` is always an absolute file offset,
+/// whether freshly computed by the streaming postings writer or rebased by
+/// [`decode_term_field_blocks`] when read back.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlockMeta {
     pub last_doc_id: DocId,
     pub max_tf: u32,
-    /// Absolute byte offset of this block's payload, into the same `.post`
-    /// byte slice `decode_term_field_blocks` was called with.
     pub offset: u64,
     pub length: u32,
 }
 
-fn write_block_meta(buf: &mut Vec<u8>, meta: &BlockMeta) {
-    write_u32(buf, meta.last_doc_id);
-    write_u32(buf, meta.max_tf);
-    write_u64(buf, meta.offset);
-    write_u32(buf, meta.length);
+pub(crate) fn write_block_meta(w: &mut impl Write, meta: &BlockMeta) -> Result<()> {
+    write_u32(w, meta.last_doc_id)?;
+    write_u32(w, meta.max_tf)?;
+    write_u64(w, meta.offset)?;
+    write_u32(w, meta.length)?;
+    Ok(())
 }
 
 fn read_block_meta(cur: &mut Cursor) -> Result<BlockMeta> {
@@ -134,11 +213,17 @@ fn read_block_meta(cur: &mut Cursor) -> Result<BlockMeta> {
     Ok(BlockMeta { last_doc_id, max_tf, offset, length })
 }
 
-fn encode_postings(
+/// Stream `.post` (postings, one term-field's blocks at a time) and `.terms`
+/// (the term dictionary, built alongside it) together, since a term is only
+/// worth writing to either once it's known to have at least one surviving
+/// posting after live-filtering.
+fn encode_postings_streaming(
     memtable: &MemTable,
     live: &RoaringBitmap,
     schema: &CollectionSchema,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+    mut terms_w: impl Write,
+    post_w: impl Write,
+) -> Result<()> {
     let num_fields = schema.fields.len();
     let mut field_doc_count = vec![0u32; num_fields];
     let mut field_total_len = vec![0u64; num_fields];
@@ -151,13 +236,17 @@ fn encode_postings(
         }
     }
 
-    // Surviving terms, in the dictionary's existing sorted order, with dead
-    // postings filtered out and any term/field left empty by that dropped.
-    struct TermBlock<'a> {
-        term: &'a str,
-        fields: Vec<(FieldId, Vec<&'a DocPosting>)>,
-    }
-    let mut blocks: Vec<TermBlock> = Vec::new();
+    let mut post_w = CountingWriter::new(post_w);
+    write_header(&mut post_w, POST_MAGIC)?;
+
+    write_header(&mut terms_w, TERMS_MAGIC)?;
+    let mut terms_builder = fst::MapBuilder::new(terms_w)
+        .map_err(|e| Error::internal(format!("building segment term dictionary: {e}")))?;
+
+    // fst requires ascending-key insertion; the dictionary is already sorted.
+    let mut term_offsets: Vec<u64> = Vec::new();
+    let mut term_id: u64 = 0;
+
     for (term, fields) in memtable.index().iter() {
         let mut kept: Vec<(FieldId, Vec<&DocPosting>)> = Vec::new();
         for (field, postings) in fields {
@@ -167,88 +256,79 @@ fn encode_postings(
                 kept.push((*field, docs));
             }
         }
-        if !kept.is_empty() {
-            blocks.push(TermBlock { term, fields: kept });
+        if kept.is_empty() {
+            continue;
         }
-    }
 
-    // fst requires ascending-key insertion; the dictionary is already sorted.
-    let mut builder = fst::MapBuilder::memory();
-    for (term_id, block) in blocks.iter().enumerate() {
-        builder
-            .insert(block.term, term_id as u64)
+        term_offsets.push(post_w.pos());
+        terms_builder
+            .insert(term, term_id)
             .map_err(|e| Error::internal(format!("building segment term dictionary: {e}")))?;
-    }
-    let fst_bytes = builder
-        .into_inner()
-        .map_err(|e| Error::internal(format!("building segment term dictionary: {e}")))?;
-    let terms = wrap_fst(TERMS_MAGIC, fst_bytes);
+        term_id += 1;
 
-    // Postings data, term by term, with an offset table so any one term's
-    // block can be located and decoded without touching the others. Within a
-    // term, each field's postings are further chunked into fixed-size blocks
-    // with their own skip-metadata directory (`BlockMeta`) — see this file's
-    // module doc and `SEGMENT_FORMAT_VERSION`'s doc comment for the shape.
-    let mut data = Vec::new();
-    let mut offsets = Vec::with_capacity(blocks.len());
-    for block in &blocks {
-        offsets.push(data.len() as u64);
-        write_u32(&mut data, block.fields.len() as u32);
-        for (field, docs) in &block.fields {
-            write_u32(&mut data, *field as u32);
-            write_u32(&mut data, docs.len() as u32); // doc_freq: O(1) to read back
+        write_u32(&mut post_w, kept.len() as u32)?;
+        for (field, docs) in &kept {
+            write_u32(&mut post_w, *field as u32)?;
+            write_u32(&mut post_w, docs.len() as u32)?; // doc_freq: O(1) to read back
 
             let chunks: Vec<&[&DocPosting]> = docs.chunks(POSTING_BLOCK_SIZE).collect();
-            write_u32(&mut data, chunks.len() as u32);
+            write_u32(&mut post_w, chunks.len() as u32)?;
 
-            // Two-pass: build every block's payload bytes into a scratch
-            // buffer first, so each block's own offset (relative to where
-            // this field's payloads begin) is known before its directory
-            // entry is written — the directory precedes the payloads on
-            // disk, so a single forward pass can't know them yet.
+            // Two-pass within this one field's blocks, bounded by this one
+            // (term, field)'s postings — not the whole segment's: each
+            // block's own offset (relative to where this field's payloads
+            // begin) must be known before its directory entry is written,
+            // and the directory precedes the payloads on disk, so a single
+            // forward pass over just this scratch buffer can't know them yet.
             let mut payloads = Vec::new();
             let mut metas = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
                 let start = payloads.len() as u64;
-                write_u32(&mut payloads, chunk.len() as u32);
+                write_u32(&mut payloads, chunk.len() as u32)?;
                 let mut max_tf = 0u32;
                 for posting in *chunk {
-                    write_u32(&mut payloads, posting.doc_id);
-                    write_u32(&mut payloads, posting.positions.len() as u32);
+                    write_u32(&mut payloads, posting.doc_id)?;
+                    write_u32(&mut payloads, posting.positions.len() as u32)?;
                     for &p in &posting.positions {
-                        write_u32(&mut payloads, p);
+                        write_u32(&mut payloads, p)?;
                     }
                     max_tf = max_tf.max(posting.positions.len() as u32);
                 }
                 metas.push(BlockMeta {
                     last_doc_id: chunk.last().expect("chunks() never yields an empty slice").doc_id,
                     max_tf,
-                    offset: start,
+                    offset: start, // relative to `payloads`; rebased to absolute below
                     length: (payloads.len() as u64 - start) as u32,
                 });
             }
 
+            let payload_base = post_w.pos() + metas.len() as u64 * BLOCK_META_LEN;
             for meta in &metas {
-                write_block_meta(&mut data, meta);
+                write_block_meta(
+                    &mut post_w,
+                    &BlockMeta { offset: payload_base + meta.offset, ..*meta },
+                )?;
             }
-            data.extend_from_slice(&payloads);
+            post_w.write_all(&payloads)?;
         }
     }
 
-    let mut post = Vec::new();
-    write_header(&mut post, POST_MAGIC);
-    write_u32(&mut post, num_fields as u32);
-    for f in 0..num_fields {
-        write_u32(&mut post, field_doc_count[f]);
-        write_u64(&mut post, field_total_len[f]);
-    }
-    write_u32(&mut post, blocks.len() as u32);
-    for off in &offsets {
-        write_u64(&mut post, *off);
-    }
-    post.extend_from_slice(&data);
+    terms_builder
+        .finish()
+        .map_err(|e| Error::internal(format!("finishing term dictionary: {e}")))?;
 
-    Ok((terms, post))
+    let footer_start = post_w.pos();
+    write_u32(&mut post_w, num_fields as u32)?;
+    for f in 0..num_fields {
+        write_u32(&mut post_w, field_doc_count[f])?;
+        write_u64(&mut post_w, field_total_len[f])?;
+    }
+    write_u32(&mut post_w, term_offsets.len() as u32)?;
+    for off in &term_offsets {
+        write_u64(&mut post_w, *off)?;
+    }
+    write_u64(&mut post_w, footer_start)?;
+    Ok(())
 }
 
 /// The small, eager part of `.post`: field stats and the offset table. O(num
@@ -256,14 +336,22 @@ fn encode_postings(
 pub(crate) struct PostHeader {
     pub field_doc_count: Vec<u32>,
     pub field_total_len: Vec<u64>,
-    /// Byte offset of term `i`'s block, relative to the start of the file.
+    /// Absolute byte offset of term `i`'s block.
     offsets: Vec<u64>,
+    /// Absolute offset the footer itself starts at — a term's block always
+    /// ends either at the next term's offset, or here for the last one.
+    footer_start: u64,
 }
 
 pub(crate) fn decode_post_header(bytes: &[u8]) -> Result<PostHeader> {
-    let mut cur = Cursor::new(bytes, "segment postings");
-    cur.read_header(POST_MAGIC)?;
+    let what = "segment postings";
+    {
+        let mut cur = Cursor::new(bytes, what);
+        cur.read_header(POST_MAGIC)?;
+    }
+    let footer_start = read_footer_start(bytes, what)?;
 
+    let mut cur = Cursor::new(&bytes[footer_start..bytes.len() - FOOTER_POINTER_LEN], what);
     let num_fields = cur.read_u32()? as usize;
     let mut field_doc_count = Vec::with_capacity(num_fields);
     let mut field_total_len = Vec::with_capacity(num_fields);
@@ -272,21 +360,13 @@ pub(crate) fn decode_post_header(bytes: &[u8]) -> Result<PostHeader> {
         field_total_len.push(cur.read_u64()?);
     }
 
-    // The offset table stores byte positions relative to the start of the
-    // *data* section, i.e. right after the table itself — read it straight,
-    // then add back where the data section begins so lookups are absolute
-    // offsets into the file.
     let num_terms = cur.read_u32()? as usize;
     let mut offsets = Vec::with_capacity(num_terms);
     for _ in 0..num_terms {
         offsets.push(cur.read_u64()?);
     }
-    let data_start = cur.position() as u64;
-    for off in &mut offsets {
-        *off += data_start;
-    }
 
-    Ok(PostHeader { field_doc_count, field_total_len, offsets })
+    Ok(PostHeader { field_doc_count, field_total_len, offsets, footer_start: footer_start as u64 })
 }
 
 const POST_BLOCK_WHAT: &str = "segment postings (term block)";
@@ -303,11 +383,17 @@ fn term_block_start(header: &PostHeader, term_id: u64) -> Result<usize> {
 fn term_block<'a>(bytes: &'a [u8], header: &PostHeader, term_id: u64) -> Result<&'a [u8]> {
     let start = term_block_start(header, term_id)?;
     let idx = term_id as usize;
-    let end =
-        if idx + 1 < header.offsets.len() { header.offsets[idx + 1] as usize } else { bytes.len() };
-    bytes
-        .get(start..end)
-        .ok_or_else(|| Error::corruption(format!("{POST_BLOCK_WHAT}: offset table out of range")))
+    let end = if idx + 1 < header.offsets.len() {
+        header.offsets[idx + 1] as usize
+    } else {
+        header.footer_start as usize
+    };
+    bytes.get(start..end).ok_or_else(|| {
+        Error::corruption(format!(
+            "{POST_BLOCK_WHAT}: offset table out of range (term_id={term_id} start={start} end={end} bytes.len()={} footer_start={} offsets.len()={})",
+            bytes.len(), header.footer_start, header.offsets.len()
+        ))
+    })
 }
 
 /// One (term, field)'s block directory: a doc-frequency count, read once, and
@@ -319,11 +405,9 @@ pub(crate) struct TermFieldBlocks {
 }
 
 /// Decode one (term, field)'s block directory: `doc_freq` and every block's
-/// `BlockMeta`, with `BlockMeta.offset` already turned into an absolute
-/// offset into `bytes` (the same convention `decode_post_header` uses for its
-/// own top-level term table, one level up). `None` if the term never occurs
-/// in this field. The production entry point for the postings walk — no
-/// posting is decoded here, only the directory that says where they live.
+/// `BlockMeta`, whose `offset` is already absolute. `None` if the term never
+/// occurs in this field. The production entry point for the postings walk —
+/// no posting is decoded here, only the directory that says where they live.
 pub(crate) fn decode_term_field_blocks(
     bytes: &[u8],
     header: &PostHeader,
@@ -331,7 +415,6 @@ pub(crate) fn decode_term_field_blocks(
     field: FieldId,
 ) -> Result<Option<TermFieldBlocks>> {
     let what = POST_BLOCK_WHAT;
-    let term_start = term_block_start(header, term_id)?;
     let block = term_block(bytes, header, term_id)?;
 
     let mut cur = Cursor::new(block, what);
@@ -342,9 +425,16 @@ pub(crate) fn decode_term_field_blocks(
         let num_blocks = cur.read_u32()? as usize;
 
         // Every block's metadata is fixed-width and read up front regardless
-        // of whether this is the field being asked about — for a field
-        // that isn't, `BlockMeta.length` is exactly what's needed to skip
-        // its payloads without decoding a single doc inside them.
+        // of whether this is the field being asked about — for a field that
+        // isn't, `BlockMeta.length` is exactly what's needed to skip its
+        // payload bytes (which, unlike the metadata, this cursor never
+        // otherwise touches) without decoding a single doc inside them.
+        // Skipping matters even though `BlockMeta.offset` is already an
+        // absolute file offset (nothing here needs rebasing, unlike the pre-
+        // v4 format): this cursor is walking a *sequential* layout — this
+        // field's payloads sit directly between its own directory and the
+        // next field's — so failing to skip past them would leave the
+        // cursor reading the next field's header starting mid-payload.
         let mut blocks = Vec::with_capacity(num_blocks);
         let mut payload_len: u64 = 0;
         for _ in 0..num_blocks {
@@ -356,11 +446,6 @@ pub(crate) fn decode_term_field_blocks(
         if this_field != field {
             cur.skip(payload_len as usize)?;
             continue;
-        }
-
-        let payloads_start = (term_start + cur.position()) as u64;
-        for meta in &mut blocks {
-            meta.offset += payloads_start;
         }
         return Ok(Some(TermFieldBlocks { doc_freq, blocks }));
     }
@@ -447,41 +532,59 @@ pub(crate) fn decode_term_field_doc_ids(
 
 // --- columns -----------------------------------------------------------
 
-const FIELD_TAG_NONE: u8 = 0;
-const FIELD_TAG_NUMERIC: u8 = 1;
-const FIELD_TAG_KEYWORD: u8 = 2;
-const NUMKEY_TAG_INT: u8 = 0;
-const NUMKEY_TAG_FLOAT: u8 = 1;
+pub(crate) const FIELD_TAG_NONE: u8 = 0;
+pub(crate) const FIELD_TAG_NUMERIC: u8 = 1;
+pub(crate) const FIELD_TAG_KEYWORD: u8 = 2;
+pub(crate) const NUMKEY_TAG_INT: u8 = 0;
+pub(crate) const NUMKEY_TAG_FLOAT: u8 = 1;
 
-fn encode_columns(memtable: &MemTable, live: &RoaringBitmap, schema: &CollectionSchema) -> Vec<u8> {
+/// Stream `.col`: one field's column at a time, in field-id order, with the
+/// per-field directory (tag, offset, length) recorded as each field's data
+/// is written and emitted as a footer once every field has been visited.
+///
+/// Keyword values are written in **sorted order** — not the `HashMap`
+/// iteration order a naive per-field walk would produce. That determinism
+/// isn't just tidiness: two encodes of the same live document set must
+/// produce byte-identical `.col` bytes for the streaming merge path's
+/// equivalence tests to be meaningful, and `HashMap`'s randomized iteration
+/// order means the pre-v4 encoder didn't actually have that property even
+/// though nothing depended on it before now.
+fn encode_columns_streaming(
+    memtable: &MemTable,
+    live: &RoaringBitmap,
+    schema: &CollectionSchema,
+    col_w: impl Write,
+) -> Result<()> {
+    let mut col_w = CountingWriter::new(col_w);
+    write_header(&mut col_w, COL_MAGIC)?;
+
     let columns = memtable.columns();
-    let mut data = Vec::new();
-    let mut directory: Vec<(u8, u32, u32)> = Vec::with_capacity(schema.fields.len());
+    let num_fields = schema.fields.len();
+    let mut directory: Vec<(u8, u64, u64)> = Vec::with_capacity(num_fields);
 
-    for field_id in 0..schema.fields.len() as FieldId {
+    for field_id in 0..num_fields as FieldId {
+        let start = col_w.pos();
         if let Some(col) = columns.numeric(field_id) {
-            let start = data.len();
             let mut pairs: Vec<(NumKey, DocId)> =
                 col.iter().filter(|(_, d)| live.contains(*d)).collect();
             pairs.sort_by(|a, b| a.0.cmp_key(&b.0).then(a.1.cmp(&b.1)));
-            write_u32(&mut data, pairs.len() as u32);
+            write_u32(&mut col_w, pairs.len() as u32)?;
             for (key, doc_id) in pairs {
                 match key {
                     NumKey::Int(i) => {
-                        write_u8(&mut data, NUMKEY_TAG_INT);
-                        write_i64(&mut data, i);
+                        write_u8(&mut col_w, NUMKEY_TAG_INT)?;
+                        write_i64(&mut col_w, i)?;
                     }
                     NumKey::Float(f) => {
-                        write_u8(&mut data, NUMKEY_TAG_FLOAT);
-                        write_f64(&mut data, f);
+                        write_u8(&mut col_w, NUMKEY_TAG_FLOAT)?;
+                        write_f64(&mut col_w, f)?;
                     }
                 }
-                write_u32(&mut data, doc_id);
+                write_u32(&mut col_w, doc_id)?;
             }
-            directory.push((FIELD_TAG_NUMERIC, start as u32, (data.len() - start) as u32));
+            directory.push((FIELD_TAG_NUMERIC, start, col_w.pos() - start));
         } else if let Some(col) = columns.keyword(field_id) {
-            let start = data.len();
-            let values: Vec<(&str, RoaringBitmap)> = col
+            let mut values: Vec<(&str, RoaringBitmap)> = col
                 .iter()
                 .filter_map(|(v, b)| {
                     let mut filtered = b.clone();
@@ -489,45 +592,40 @@ fn encode_columns(memtable: &MemTable, live: &RoaringBitmap, schema: &Collection
                     (!filtered.is_empty()).then_some((v, filtered))
                 })
                 .collect();
-            write_u32(&mut data, values.len() as u32);
+            values.sort_by(|a, b| a.0.cmp(b.0));
+            write_u32(&mut col_w, values.len() as u32)?;
             for (value, bitmap) in &values {
-                write_str(&mut data, value);
+                write_str(&mut col_w, value)?;
                 let mut ser = Vec::new();
                 bitmap.serialize_into(&mut ser).expect("writing to a Vec cannot fail");
-                write_bytes(&mut data, &ser);
+                write_bytes(&mut col_w, &ser)?;
             }
             let mut present = col.present().clone();
             present &= live;
             let mut ser = Vec::new();
             present.serialize_into(&mut ser).expect("writing to a Vec cannot fail");
-            write_bytes(&mut data, &ser);
-            directory.push((FIELD_TAG_KEYWORD, start as u32, (data.len() - start) as u32));
+            write_bytes(&mut col_w, &ser)?;
+            directory.push((FIELD_TAG_KEYWORD, start, col_w.pos() - start));
         } else {
             directory.push((FIELD_TAG_NONE, 0, 0));
         }
     }
 
-    // The directory's own size is known up front (fixed 9 bytes per field),
-    // so each entry's absolute offset can be computed directly — no need to
-    // write placeholders and patch them after the fact.
-    let data_start = (HEADER_LEN + 4 + schema.fields.len() * 9) as u32;
-
-    let mut buf = Vec::new();
-    write_header(&mut buf, COL_MAGIC);
-    write_u32(&mut buf, schema.fields.len() as u32);
+    let footer_start = col_w.pos();
+    write_u32(&mut col_w, num_fields as u32)?;
     for &(tag, offset, length) in &directory {
-        write_u8(&mut buf, tag);
-        write_u32(&mut buf, if tag == FIELD_TAG_NONE { 0 } else { offset + data_start });
-        write_u32(&mut buf, length);
+        write_u8(&mut col_w, tag)?;
+        write_u64(&mut col_w, offset)?;
+        write_u64(&mut col_w, length)?;
     }
-    buf.extend_from_slice(&data);
-    buf
+    write_u64(&mut col_w, footer_start)?;
+    Ok(())
 }
 
 struct ColEntry {
     tag: u8,
-    offset: u32,
-    length: u32,
+    offset: u64,
+    length: u64,
 }
 
 pub(crate) struct ColHeader {
@@ -535,14 +633,20 @@ pub(crate) struct ColHeader {
 }
 
 pub(crate) fn decode_col_header(bytes: &[u8]) -> Result<ColHeader> {
-    let mut cur = Cursor::new(bytes, "segment columns");
-    cur.read_header(COL_MAGIC)?;
+    let what = "segment columns";
+    {
+        let mut cur = Cursor::new(bytes, what);
+        cur.read_header(COL_MAGIC)?;
+    }
+    let footer_start = read_footer_start(bytes, what)?;
+
+    let mut cur = Cursor::new(&bytes[footer_start..bytes.len() - FOOTER_POINTER_LEN], what);
     let num_fields = cur.read_u32()? as usize;
     let mut directory = Vec::with_capacity(num_fields);
     for _ in 0..num_fields {
         let tag = cur.read_u8()?;
-        let offset = cur.read_u32()?;
-        let length = cur.read_u32()?;
+        let offset = cur.read_u64()?;
+        let length = cur.read_u64()?;
         directory.push(ColEntry { tag, offset, length });
     }
     Ok(ColHeader { directory })
@@ -603,20 +707,22 @@ pub(crate) fn decode_keyword_column(
 
 // --- doc store -----------------------------------------------------------
 //
-// Four parallel sections, every one addressable in O(1) from a `doc_id`:
+// One forward pass, one document at a time, in doc id order:
 //
-//   field_lengths  dense (end-base)*num_fields*u32          zero-copy read
-//   values_dir     dense (end-base)*num_fields*9 bytes       zero-copy for
-//                                                             scalars, one
-//                                                             offset hop into
-//                                                             `strings` for
-//                                                             text/arrays
-//   source_dir     dense (end-base)*8 bytes (offset,len)     one hop into
-//                                                             `source`, paid
-//                                                             only when a
-//                                                             document is
-//                                                             actually
-//                                                             materialized
+//   blob          value overflow (Str/Array) + source JSON, appended as
+//                 encountered, immediately after the header             streamed
+//   field_lengths dense (end-base)*num_fields*4                         bounded scratch,
+//   values_dir    dense (end-base)*num_fields*VALUE_SLOT_LEN            written after
+//   source_dir    dense (end-base)*12                                   the blob
+//   presence      serialized roaring bitmap
+//   footer        base/end/num_fields/presence_len/blob_len/footer_start
+//
+// The three dense sections are bounded by document count × field count, not
+// by document *content* — the same order of magnitude a memtable already
+// holds resident, and not what this format change is about. What it is
+// about is `blob`: raw text and JSON, the part that actually scales with
+// corpus size, which streams straight to the sink as each document is
+// visited instead of accumulating in a `Vec` for the whole segment.
 //
 // `field_lengths` is BM25's `|d|`, read once per scored document — it must
 // never cost an allocation, which is why it gets its own flat array instead
@@ -626,41 +732,47 @@ const VALUE_TAG_NULL: u8 = 0;
 const VALUE_TAG_BOOL: u8 = 1;
 const VALUE_TAG_INT: u8 = 2;
 const VALUE_TAG_FLOAT: u8 = 3;
-const VALUE_TAG_STR: u8 = 4;
-const VALUE_TAG_ARRAY: u8 = 5;
+pub(crate) const VALUE_TAG_STR: u8 = 4;
+pub(crate) const VALUE_TAG_ARRAY: u8 = 5;
 
-const VALUE_SLOT_LEN: usize = 9; // 1 tag byte + 8 data bytes
+/// 1 tag byte + 8-byte blob offset + 4-byte blob length. `Null`/`Bool`/
+/// `Int`/`Float` only use the first of those 12 payload bytes (or the first
+/// 9, for `Int`/`Float`'s inline value) and leave the rest zeroed; `Str`/
+/// `Array` use all of it to point into the blob. One width for every tag
+/// keeps the array directly indexable by `(doc, field)` — an `Int` costs the
+/// same 13 bytes a `Str` does, in exchange for O(1) addressing.
+const VALUE_SLOT_LEN: usize = 13;
 
-/// The general recursive encoding used for anything that doesn't fit a fixed
-/// 9-byte slot (`Str`, `Array`) — written into the `strings` section and
-/// referenced from a slot by `(offset, length)`.
-fn write_value_full(buf: &mut Vec<u8>, value: &Value) {
+/// The general recursive encoding used for `Str`/`Array` values — written
+/// into the blob and referenced from a slot by `(offset, length)`.
+fn write_value_full(w: &mut impl Write, value: &Value) -> Result<()> {
     match value {
-        Value::Null => write_u8(buf, VALUE_TAG_NULL),
+        Value::Null => write_u8(w, VALUE_TAG_NULL)?,
         Value::Bool(b) => {
-            write_u8(buf, VALUE_TAG_BOOL);
-            write_u8(buf, *b as u8);
+            write_u8(w, VALUE_TAG_BOOL)?;
+            write_u8(w, *b as u8)?;
         }
         Value::Int(i) => {
-            write_u8(buf, VALUE_TAG_INT);
-            write_i64(buf, *i);
+            write_u8(w, VALUE_TAG_INT)?;
+            write_i64(w, *i)?;
         }
         Value::Float(f) => {
-            write_u8(buf, VALUE_TAG_FLOAT);
-            write_f64(buf, *f);
+            write_u8(w, VALUE_TAG_FLOAT)?;
+            write_f64(w, *f)?;
         }
         Value::Str(s) => {
-            write_u8(buf, VALUE_TAG_STR);
-            write_str(buf, s);
+            write_u8(w, VALUE_TAG_STR)?;
+            write_str(w, s)?;
         }
         Value::Array(items) => {
-            write_u8(buf, VALUE_TAG_ARRAY);
-            write_u32(buf, items.len() as u32);
+            write_u8(w, VALUE_TAG_ARRAY)?;
+            write_u32(w, items.len() as u32)?;
             for item in items {
-                write_value_full(buf, item);
+                write_value_full(w, item)?;
             }
         }
     }
+    Ok(())
 }
 
 fn read_value_full(cur: &mut Cursor) -> Result<Value> {
@@ -682,9 +794,10 @@ fn read_value_full(cur: &mut Cursor) -> Result<Value> {
     }
 }
 
-/// Write one field's value into its fixed-width directory slot, spilling
-/// variable-length content (`Str`/`Array`) into `strings`.
-fn encode_value_slot(slot: &mut [u8], value: &Value, strings: &mut Vec<u8>) {
+/// Write one field's value into its fixed-width directory slot. `Str`/
+/// `Array` values must already have been written to the blob by the caller;
+/// `blob_offset`/`blob_len` locate those bytes. Every other tag ignores both.
+fn encode_value_slot(slot: &mut [u8], value: &Value, blob_offset: u64, blob_len: u32) {
     debug_assert_eq!(slot.len(), VALUE_SLOT_LEN);
     match value {
         Value::Null => slot[0] = VALUE_TAG_NULL,
@@ -702,29 +815,31 @@ fn encode_value_slot(slot: &mut [u8], value: &Value, strings: &mut Vec<u8>) {
         }
         Value::Str(_) | Value::Array(_) => {
             slot[0] = if matches!(value, Value::Str(_)) { VALUE_TAG_STR } else { VALUE_TAG_ARRAY };
-            let mut encoded = Vec::new();
-            write_value_full(&mut encoded, value);
-            let offset = strings.len() as u32;
-            let length = encoded.len() as u32;
-            strings.extend_from_slice(&encoded);
-            slot[1..5].copy_from_slice(&offset.to_le_bytes());
-            slot[5..9].copy_from_slice(&length.to_le_bytes());
+            slot[1..9].copy_from_slice(&blob_offset.to_le_bytes());
+            slot[9..13].copy_from_slice(&blob_len.to_le_bytes());
         }
     }
 }
 
-fn encode_docs(memtable: &MemTable, schema: &CollectionSchema) -> Vec<u8> {
+fn encode_docs_streaming(
+    memtable: &MemTable,
+    schema: &CollectionSchema,
+    doc_w: impl Write,
+) -> Result<()> {
+    let mut doc_w = CountingWriter::new(doc_w);
+    write_header(&mut doc_w, DOC_MAGIC)?;
+
     let base = memtable.base();
     let end = memtable.next_doc_id(); // exclusive
     let len = (end - base) as usize;
     let num_fields = schema.fields.len();
 
+    let blob_start = doc_w.pos();
+
     let mut presence = RoaringBitmap::new();
     let mut field_lengths = vec![0u8; len * num_fields * 4];
     let mut values_dir = vec![0u8; len * num_fields * VALUE_SLOT_LEN];
-    let mut strings = Vec::new();
-    let mut source_dir = vec![0u8; len * 8];
-    let mut source = Vec::new();
+    let mut source_dir = vec![0u8; len * 12]; // u64 offset + u32 length
 
     for (doc_id, doc) in memtable.iter() {
         presence.insert(doc_id);
@@ -737,48 +852,52 @@ fn encode_docs(memtable: &MemTable, schema: &CollectionSchema) -> Vec<u8> {
 
             let value = doc.values.get(f).unwrap_or(&Value::Null);
             let slot_pos = idx * num_fields * VALUE_SLOT_LEN + f * VALUE_SLOT_LEN;
+
+            let (blob_offset, blob_len) = if matches!(value, Value::Str(_) | Value::Array(_)) {
+                let offset = doc_w.pos();
+                write_value_full(&mut doc_w, value)?;
+                (offset, (doc_w.pos() - offset) as u32)
+            } else {
+                (0, 0)
+            };
             encode_value_slot(
                 &mut values_dir[slot_pos..slot_pos + VALUE_SLOT_LEN],
                 value,
-                &mut strings,
+                blob_offset,
+                blob_len,
             );
         }
 
-        let source_bytes =
-            serde_json::to_vec(&doc.source).expect("an already-parsed document is valid JSON");
-        let offset = source.len() as u32;
-        let length = source_bytes.len() as u32;
-        source.extend_from_slice(&source_bytes);
-        let sd_pos = idx * 8;
-        source_dir[sd_pos..sd_pos + 4].copy_from_slice(&offset.to_le_bytes());
-        source_dir[sd_pos + 4..sd_pos + 8].copy_from_slice(&length.to_le_bytes());
+        let source_offset = doc_w.pos();
+        serde_json::to_writer(&mut doc_w, &doc.source)?;
+        let source_len = (doc_w.pos() - source_offset) as u32;
+        let sd_pos = idx * 12;
+        source_dir[sd_pos..sd_pos + 8].copy_from_slice(&source_offset.to_le_bytes());
+        source_dir[sd_pos + 8..sd_pos + 12].copy_from_slice(&source_len.to_le_bytes());
     }
 
-    let mut buf = Vec::new();
-    write_header(&mut buf, DOC_MAGIC);
-    write_u32(&mut buf, base);
-    write_u32(&mut buf, end);
-    write_u32(&mut buf, num_fields as u32);
+    let blob_len = doc_w.pos() - blob_start;
+
+    doc_w.write_all(&field_lengths)?;
+    doc_w.write_all(&values_dir)?;
+    doc_w.write_all(&source_dir)?;
 
     let mut presence_bytes = Vec::new();
     presence.serialize_into(&mut presence_bytes).expect("writing to a Vec cannot fail");
-    write_u32(&mut buf, presence_bytes.len() as u32);
-    buf.extend_from_slice(&presence_bytes);
+    doc_w.write_all(&presence_bytes)?;
 
-    write_u32(&mut buf, strings.len() as u32);
-    write_u32(&mut buf, source.len() as u32);
-
-    buf.extend_from_slice(&field_lengths);
-    buf.extend_from_slice(&values_dir);
-    buf.extend_from_slice(&source_dir);
-    buf.extend_from_slice(&strings);
-    buf.extend_from_slice(&source);
-
-    buf
+    let footer_start = doc_w.pos();
+    write_u32(&mut doc_w, base)?;
+    write_u32(&mut doc_w, end)?;
+    write_u32(&mut doc_w, num_fields as u32)?;
+    write_u32(&mut doc_w, presence_bytes.len() as u32)?;
+    write_u64(&mut doc_w, blob_len)?;
+    write_u64(&mut doc_w, footer_start)?;
+    Ok(())
 }
 
 /// The small, eager part of `.doc`: the doc-id range, field count, presence
-/// bitmap, and the byte offsets of each section. O(corpus / 8) for the
+/// bitmap, and the byte offsets of each dense section. O(corpus / 8) for the
 /// presence bitmap (typically far less once roaring compresses a dense
 /// range); everything else here is O(1).
 pub(crate) struct DocHeader {
@@ -789,38 +908,39 @@ pub(crate) struct DocHeader {
     field_lengths_start: usize,
     values_dir_start: usize,
     source_dir_start: usize,
-    strings_start: usize,
-    source_start: usize,
 }
 
 pub(crate) fn decode_doc_header(bytes: &[u8]) -> Result<DocHeader> {
-    let mut cur = Cursor::new(bytes, "segment doc store");
-    cur.read_header(DOC_MAGIC)?;
+    let what = "segment doc store";
+    {
+        let mut cur = Cursor::new(bytes, what);
+        cur.read_header(DOC_MAGIC)?;
+    }
+    let footer_start = read_footer_start(bytes, what)?;
+
+    let mut cur = Cursor::new(&bytes[footer_start..bytes.len() - FOOTER_POINTER_LEN], what);
     let base = cur.read_u32()?;
     let end = cur.read_u32()?;
     if end < base {
         return Err(Error::corruption("segment doc store: end before base".to_string()));
     }
     let num_fields = cur.read_u32()? as usize;
-
     let presence_len = cur.read_u32()? as usize;
-    let presence = RoaringBitmap::deserialize_from(cur.read_exact(presence_len)?)?;
-
-    let strings_len = cur.read_u32()? as usize;
-    let source_len = cur.read_u32()? as usize;
+    let blob_len = cur.read_u64()?;
 
     let len = (end - base) as usize;
-    let field_lengths_start = cur.position();
+    let field_lengths_start = HEADER_LEN + blob_len as usize;
     let values_dir_start = field_lengths_start + len * num_fields * 4;
     let source_dir_start = values_dir_start + len * num_fields * VALUE_SLOT_LEN;
-    let strings_start = source_dir_start + len * 8;
-    let source_start = strings_start + strings_len;
-    let expected_end = source_start + source_len;
-    if expected_end > bytes.len() {
+    let presence_start = source_dir_start + len * 12;
+    let expected_end = presence_start + presence_len;
+    if expected_end > footer_start {
         return Err(Error::corruption(
-            "segment doc store: sections run past end of file".to_string(),
+            "segment doc store: sections run past the footer".to_string(),
         ));
     }
+    let presence =
+        RoaringBitmap::deserialize_from(bytes_at(bytes, presence_start, presence_len, what)?)?;
 
     Ok(DocHeader {
         base,
@@ -830,8 +950,6 @@ pub(crate) fn decode_doc_header(bytes: &[u8]) -> Result<DocHeader> {
         field_lengths_start,
         values_dir_start,
         source_dir_start,
-        strings_start,
-        source_start,
     })
 }
 
@@ -882,9 +1000,9 @@ pub(crate) fn value_at(
         VALUE_TAG_INT => Value::Int(i64_at(bytes, pos + 1, what)?),
         VALUE_TAG_FLOAT => Value::Float(f64_at(bytes, pos + 1, what)?),
         VALUE_TAG_STR | VALUE_TAG_ARRAY => {
-            let offset = u32_at(bytes, pos + 1, what)? as usize;
-            let length = u32_at(bytes, pos + 5, what)? as usize;
-            let slice = bytes_at(bytes, header.strings_start + offset, length, what)?;
+            let offset = u64_at(bytes, pos + 1, what)? as usize;
+            let length = u32_at(bytes, pos + 9, what)? as usize;
+            let slice = bytes_at(bytes, offset, length, what)?;
             let mut cur = Cursor::new(slice, what);
             read_value_full(&mut cur)?
         }
@@ -898,14 +1016,76 @@ pub(crate) fn value_at(
 pub(crate) fn source_at(bytes: &[u8], header: &DocHeader, doc_id: DocId) -> Result<Option<Json>> {
     let idx = doc_index(header, doc_id)?;
     let what = "segment doc store (source)";
-    let pos = header.source_dir_start + idx * 8;
-    let offset = u32_at(bytes, pos, what)? as usize;
-    let length = u32_at(bytes, pos + 4, what)? as usize;
+    let pos = header.source_dir_start + idx * 12;
+    let offset = u64_at(bytes, pos, what)? as usize;
+    let length = u32_at(bytes, pos + 8, what)? as usize;
     if length == 0 {
         return Ok(None);
     }
-    let slice = bytes_at(bytes, header.source_start + offset, length, what)?;
+    let slice = bytes_at(bytes, offset, length, what)?;
     Ok(Some(serde_json::from_slice(slice)?))
+}
+
+/// The document's verbatim source JSON as raw bytes, with no parse — used by
+/// the streaming merge path to copy a document's stored form into a new
+/// segment's blob without round-tripping it through `serde_json::Value`.
+pub(crate) fn raw_source_at<'a>(
+    bytes: &'a [u8],
+    header: &DocHeader,
+    doc_id: DocId,
+) -> Result<Option<&'a [u8]>> {
+    let idx = doc_index(header, doc_id)?;
+    let what = "segment doc store (source)";
+    let pos = header.source_dir_start + idx * 12;
+    let offset = u64_at(bytes, pos, what)? as usize;
+    let length = u32_at(bytes, pos + 8, what)? as usize;
+    if length == 0 {
+        return Ok(None);
+    }
+    Ok(Some(bytes_at(bytes, offset, length, what)?))
+}
+
+/// A field's raw value-slot bytes and, if the tag is `Str`/`Array`, the raw
+/// blob bytes they point at — used by the streaming merge path to copy a
+/// document's value into a new segment without decoding it into a `Value`
+/// and re-encoding, for every field whose slot doesn't need rebasing (i.e.
+/// isn't `Str`/`Array`) or whose blob bytes can be copied verbatim.
+pub(crate) fn raw_value_slot_at<'a>(
+    bytes: &'a [u8],
+    header: &DocHeader,
+    doc_id: DocId,
+    field: FieldId,
+) -> Result<(u8, &'a [u8], u64, u32)> {
+    let idx = doc_index(header, doc_id)?;
+    let what = "segment doc store (value)";
+    if field as usize >= header.num_fields {
+        return Err(Error::corruption(format!("{what}: field out of range")));
+    }
+    let pos = header.values_dir_start
+        + idx * header.num_fields * VALUE_SLOT_LEN
+        + field as usize * VALUE_SLOT_LEN;
+    let slot = bytes_at(bytes, pos, VALUE_SLOT_LEN, what)?;
+    let tag = slot[0];
+    match tag {
+        VALUE_TAG_STR | VALUE_TAG_ARRAY => {
+            let offset = u64_at(bytes, pos + 1, what)? as usize;
+            let length = u32_at(bytes, pos + 9, what)? as usize;
+            let blob = bytes_at(bytes, offset, length, what)?;
+            Ok((tag, blob, offset as u64, length as u32))
+        }
+        _ => Ok((tag, slot, 0, 0)),
+    }
+}
+
+pub(crate) fn field_lengths_row<'a>(
+    bytes: &'a [u8],
+    header: &DocHeader,
+    doc_id: DocId,
+) -> Result<&'a [u8]> {
+    let idx = doc_index(header, doc_id)?;
+    let what = "segment doc store (field length)";
+    let pos = header.field_lengths_start + idx * header.num_fields * 4;
+    bytes_at(bytes, pos, header.num_fields * 4, what)
 }
 
 #[cfg(test)]
@@ -1331,5 +1511,41 @@ mod tests {
         let term_id = terms.get("mouse").unwrap();
 
         assert!(decode_term_field_blocks(&encoded.post, &header, term_id, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn encoding_the_same_memtable_twice_produces_byte_identical_segments() {
+        // The pre-v4 encoder's `.col` keyword section iterated a `HashMap`
+        // directly, so two encodes of the same live document set were not
+        // guaranteed to agree byte-for-byte even though nothing depended on
+        // that — this pins the determinism the streaming merge path's own
+        // equivalence tests lean on.
+        let schema = CollectionSchema::new(
+            "things",
+            vec![
+                FieldSchema::new("title", FieldType::Text),
+                FieldSchema::new("brand", FieldType::Keyword).with_facet(true),
+            ],
+        );
+        let mut m = MemTable::new(0, &schema);
+        for (i, brand) in
+            ["Logitech", "Razer", "Anker", "Corsair", "HyperX", "SteelSeries"].iter().enumerate()
+        {
+            m.insert(
+                ParsedDocument::parse(
+                    json!({ "id": i.to_string(), "title": format!("item {i}"), "brand": brand }),
+                    &schema,
+                )
+                .unwrap(),
+            );
+        }
+
+        let a = encode(&m, &schema).unwrap();
+        let b = encode(&m, &schema).unwrap();
+        assert_eq!(a.terms, b.terms);
+        assert_eq!(a.ids, b.ids);
+        assert_eq!(a.post, b.post);
+        assert_eq!(a.col, b.col);
+        assert_eq!(a.doc, b.doc);
     }
 }

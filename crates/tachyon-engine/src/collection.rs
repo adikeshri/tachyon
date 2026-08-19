@@ -16,6 +16,9 @@
 //! order. Because doc ids are assigned sequentially from `state.next_doc_id`,
 //! replay reconstructs exactly the ids the crashed process had assigned.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -25,14 +28,17 @@ use serde_json::Value as Json;
 use utoipa::ToSchema;
 
 use tachyon_core::{CollectionSchema, DocId, Error, ParsedDocument, Result};
-use tachyon_index::{encode, IndexSource, MemTable, SegmentFilePaths, SegmentReader};
+use tachyon_index::{
+    encode_streaming, merge_segments, IndexSource, MemTable, MergeInput, SegmentFilePaths,
+    SegmentReader,
+};
 use tachyon_query::{
     compute_facets, execute, suggest, Hit, SearchContext, SearchParams, SearchRequest,
     SearchResponse, SuggestParams, SuggestRequest, SuggestResponse,
 };
 use tachyon_storage::layout::sync_dir;
 use tachyon_storage::{
-    meta, wal, write_atomic, CollectionState, Layout, SegmentRef, Wal, WalRecord, WalRecordRef,
+    meta, wal, CollectionState, Layout, SegmentRef, Wal, WalRecord, WalRecordRef,
 };
 
 use crate::config::EngineConfig;
@@ -46,6 +52,99 @@ fn segment_file_paths(layout: &Layout, name: &str, id: u64) -> SegmentFilePaths 
         post: layout.segment_file(name, id, "post"),
         col: layout.segment_file(name, id, "col"),
         doc: layout.segment_file(name, id, "doc"),
+    }
+}
+
+/// `.tmp`-suffixed sibling of a segment file path, used while its bytes are
+/// still streaming to disk. Distinct from `write_atomic`'s own `.tmp`
+/// convention (which replaces the extension, fine for one file written and
+/// renamed at a time) because [`SegmentFiles`] has all five of one segment's
+/// files open and being streamed into at once — replacing the extension
+/// would collide every one of them on the same `<id>.tmp` path.
+fn segment_tmp_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// Buffer size for each of the five open files' `BufWriter`. `encode_streaming`
+/// and `merge_segments` write in small increments — a `u32` or `u64` field at
+/// a time — so wrapping the raw `File` matters a great deal here: without it,
+/// every one of those tiny writes is its own `write(2)` syscall, which turned
+/// out to cost over an order of magnitude of indexing throughput when this
+/// was benchmarked unbuffered. 256 KiB comfortably holds even a wide term's
+/// or a large document's worth of writes before it needs to flush.
+const SEGMENT_WRITE_BUF_SIZE: usize = 256 * 1024;
+
+/// The five open files one segment's bytes stream into — the same durability
+/// shape `write_atomic` gives a single file (write to a temp sibling, fsync,
+/// rename, fsync the directory), just committed as one group of five rather
+/// than one file at a time, since [`tachyon_index::encode_streaming`] and
+/// [`tachyon_index::merge_segments`] write across all five in a single pass
+/// rather than producing one finished blob per file.
+struct SegmentFiles {
+    terms: BufWriter<File>,
+    ids: BufWriter<File>,
+    post: BufWriter<File>,
+    col: BufWriter<File>,
+    doc: BufWriter<File>,
+    tmp: SegmentFilePaths,
+    dest: SegmentFilePaths,
+}
+
+impl SegmentFiles {
+    fn create(paths: &SegmentFilePaths) -> Result<SegmentFiles> {
+        let parent = paths
+            .terms
+            .parent()
+            .ok_or_else(|| Error::internal("segment path has no parent directory"))?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = SegmentFilePaths {
+            terms: segment_tmp_path(&paths.terms),
+            ids: segment_tmp_path(&paths.ids),
+            post: segment_tmp_path(&paths.post),
+            col: segment_tmp_path(&paths.col),
+            doc: segment_tmp_path(&paths.doc),
+        };
+        let buffered = |path: &Path| -> Result<BufWriter<File>> {
+            Ok(BufWriter::with_capacity(SEGMENT_WRITE_BUF_SIZE, File::create(path)?))
+        };
+        Ok(SegmentFiles {
+            terms: buffered(&tmp.terms)?,
+            ids: buffered(&tmp.ids)?,
+            post: buffered(&tmp.post)?,
+            col: buffered(&tmp.col)?,
+            doc: buffered(&tmp.doc)?,
+            tmp,
+            dest: paths.clone(),
+        })
+    }
+
+    /// Flush each `BufWriter`'s remaining bytes, fsync every underlying
+    /// file, rename each into place, then fsync the directory — the commit
+    /// point: a crash before the renames leaves the previous state intact
+    /// and these temp files orphaned but harmless, since nothing outside
+    /// `state.json` ever names a segment id.
+    fn commit(self, segments_dir: &Path) -> Result<()> {
+        fn finish(mut w: BufWriter<File>) -> Result<()> {
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| Error::internal(format!("flushing segment file: {e}")))?
+                .sync_all()?;
+            Ok(())
+        }
+        finish(self.terms)?;
+        finish(self.ids)?;
+        finish(self.post)?;
+        finish(self.col)?;
+        finish(self.doc)?;
+        std::fs::rename(&self.tmp.terms, &self.dest.terms)?;
+        std::fs::rename(&self.tmp.ids, &self.dest.ids)?;
+        std::fs::rename(&self.tmp.post, &self.dest.post)?;
+        std::fs::rename(&self.tmp.col, &self.dest.col)?;
+        std::fs::rename(&self.tmp.doc, &self.dest.doc)?;
+        sync_dir(segments_dir)?;
+        Ok(())
     }
 }
 
@@ -447,15 +546,18 @@ impl Collection {
         }
 
         let segment_id = inner.state.next_segment_id;
-        let encoded = encode(&inner.memtable, schema)?;
         let paths = segment_file_paths(layout, &schema.name, segment_id);
-
-        write_atomic(&paths.terms, &encoded.terms)?;
-        write_atomic(&paths.ids, &encoded.ids)?;
-        write_atomic(&paths.post, &encoded.post)?;
-        write_atomic(&paths.col, &encoded.col)?;
-        write_atomic(&paths.doc, &encoded.doc)?;
-        sync_dir(&layout.segments_dir(&schema.name))?;
+        let mut files = SegmentFiles::create(&paths)?;
+        encode_streaming(
+            &inner.memtable,
+            schema,
+            &mut files.terms,
+            &mut files.ids,
+            &mut files.post,
+            &mut files.col,
+            &mut files.doc,
+        )?;
+        files.commit(&layout.segments_dir(&schema.name))?;
 
         let new_wal_generation = inner.state.wal_generation + 1;
         let new_wal =
@@ -516,18 +618,18 @@ impl Collection {
     /// A merge renumbers rather than preserves doc ids. `SegmentRef`'s
     /// range is fixed for a segment's life and doc ids are never reused, so
     /// preserving the originals across a merge would mean building a new
-    /// on-disk segment out of two *already-encoded* ones — a from-scratch
-    /// k-way merge of sorted term dictionaries and postings, with nothing
-    /// in this codebase to build that on top of. Renumbering instead means
-    /// a merge is just: fetch each live document's source, run it through
-    /// the exact same `ParsedDocument::parse` + `MemTable::insert` path a
-    /// fresh write already takes, and call the existing `encode` on the
-    /// result — the entire pipeline is reused unchanged, and the only new
-    /// code here is picking victims and updating the commit state. The
-    /// cost is re-tokenizing every merged document; that's fine because a
-    /// merge is infrequent background-ish work, not a query-path cost.
-    /// Doc ids retired this way are simply never claimed again — no
-    /// segment or memtable ever covers that range afterward — except that
+    /// on-disk segment out of two *already-encoded* ones — which, since
+    /// `tachyon_index::merge_segments`, is exactly what this does: a
+    /// streaming k-way merge of the victims' term dictionaries, postings,
+    /// columns, and doc stores, straight into the output segment's five
+    /// files. Renumbering is still required (the union of two segments'
+    /// doc id ranges is never itself contiguous once dead documents drop
+    /// out), so this still picks victims and remaps every surviving id, but
+    /// nothing here re-parses a document's source or re-tokenizes its text
+    /// — that work already happened once, when each victim was first
+    /// flushed, and a merge's job is to copy it forward, not redo it. Doc
+    /// ids retired this way are simply never claimed again — no segment or
+    /// memtable ever covers that range afterward — except that
     /// `inner.deleted` can hold stale tombstones for them, which this
     /// prunes explicitly.
     ///
@@ -558,9 +660,6 @@ impl Collection {
         let victim_readers: Vec<Arc<SegmentReader>> =
             victims.iter().map(|&i| Arc::clone(&inner.segments[i])).collect();
 
-        // Rebuild: every live, non-tombstoned document across the victims,
-        // re-validated and re-tokenized exactly like a fresh insert.
-        //
         // The range this claims must start from the *active* memtable's own
         // `next_doc_id()`, not `inner.state.next_doc_id` — the two agree
         // when merging runs right after a flush (the common case: the fresh
@@ -572,25 +671,21 @@ impl Collection {
         // range is claimed, the memtable is told to skip over it too — see
         // that call's comment for why.
         let merge_base = inner.memtable.next_doc_id();
-        let mut merged = MemTable::new(merge_base, schema);
-        for reader in &victim_readers {
-            for doc_id in reader.min_doc_id()..reader.end_doc_id() {
-                if !reader.is_live(doc_id) || inner.deleted.contains(doc_id) {
-                    continue;
-                }
-                let Some(source) = reader.get(doc_id) else { continue };
-                let parsed = ParsedDocument::parse(source, schema).map_err(|e| {
-                    Error::corruption(format!(
-                        "segment doc {doc_id} failed to re-parse during merge: {e}"
-                    ))
-                })?;
-                merged.insert(parsed);
-            }
-        }
-        // How many ids `merged` actually claimed out of `merge_base`'s range
-        // — 0 if every victim document turned out to be dead, same as
-        // `wrote_segment` below computes it.
-        let claimed = merged.next_doc_id() - merge_base;
+
+        // Each victim's own surviving doc ids: its presence bitmap (already
+        // excludes anything that was a hole when it was flushed) minus
+        // whatever the collection has tombstoned since. `merge_segments`
+        // remaps every id in here to a fresh, dense, monotone range starting
+        // at `merge_base` — see its own doc comment for exactly how.
+        let merge_inputs: Vec<MergeInput> = victim_readers
+            .iter()
+            .map(|reader| {
+                let mut live = reader.presence().clone();
+                live -= &inner.deleted;
+                MergeInput { reader: reader.as_ref(), live }
+            })
+            .collect();
+        let claimed: DocId = merge_inputs.iter().map(|input| input.live.len() as DocId).sum();
 
         let mut new_state = inner.state.clone();
 
@@ -613,22 +708,27 @@ impl Collection {
 
         // Every document merged away was dead — nothing to write, the
         // victims simply disappear with no replacement.
-        let wrote_segment = merged.next_doc_id() > merged.base();
+        let wrote_segment = claimed > 0;
         let mut new_reader = None;
         if wrote_segment {
             let segment_id = new_state.next_segment_id;
-            let encoded = encode(&merged, schema)?;
             let paths = segment_file_paths(layout, &schema.name, segment_id);
-
-            write_atomic(&paths.terms, &encoded.terms)?;
-            write_atomic(&paths.ids, &encoded.ids)?;
-            write_atomic(&paths.post, &encoded.post)?;
-            write_atomic(&paths.col, &encoded.col)?;
-            write_atomic(&paths.doc, &encoded.doc)?;
-            sync_dir(&layout.segments_dir(&schema.name))?;
+            let mut files = SegmentFiles::create(&paths)?;
+            let stats = merge_segments(
+                &merge_inputs,
+                schema,
+                merge_base,
+                &mut files.terms,
+                &mut files.ids,
+                &mut files.post,
+                &mut files.col,
+                &mut files.doc,
+            )?;
+            files.commit(&layout.segments_dir(&schema.name))?;
+            debug_assert_eq!(stats.doc_count as DocId, claimed);
 
             new_state.next_segment_id += 1;
-            new_state.next_doc_id = merged.next_doc_id();
+            new_state.next_doc_id = merge_base + claimed;
             // `victims[0]` is the smallest victim index, which — now that
             // every victim has been removed — equals the number of
             // untouched segments that came before it. Inserting there puts
@@ -639,9 +739,9 @@ impl Collection {
                 victims[0],
                 SegmentRef {
                     id: segment_id,
-                    doc_count: merged.len() as u32,
-                    min_doc_id: merged.base(),
-                    max_doc_id: merged.next_doc_id() - 1,
+                    doc_count: stats.doc_count as u32,
+                    min_doc_id: merge_base,
+                    max_doc_id: merge_base + claimed - 1,
                 },
             );
             new_reader = Some(Arc::new(SegmentReader::open(&paths, schema)?));

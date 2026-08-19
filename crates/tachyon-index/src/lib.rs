@@ -17,6 +17,9 @@ pub use cursor::{MergeCursor, PostingCursor};
 pub use fuzzy::{distance_within, FuzzyMatcher};
 pub use inverted::{DocPosting, FieldPostings, InvertedIndex};
 pub use memtable::{MemTable, StoredDoc};
-pub use segment::{encode, EncodedSegment, SegmentFilePaths, SegmentReader};
+pub use segment::{
+    encode, encode_streaming, merge_segments, EncodedSegment, MergeInput, MergeStats,
+    SegmentFilePaths, SegmentReader,
+};
 pub use source::IndexSource;
 pub use tokenizer::{tokenize, Token};

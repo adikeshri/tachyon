@@ -12,7 +12,9 @@
 mod codec;
 mod cursor;
 mod format;
+mod merge;
 mod reader;
 
-pub use codec::{encode, EncodedSegment};
+pub use codec::{encode, encode_streaming, EncodedSegment};
+pub use merge::{merge_segments, MergeInput, MergeStats};
 pub use reader::{SegmentFilePaths, SegmentReader};
