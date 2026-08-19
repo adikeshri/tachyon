@@ -199,12 +199,6 @@ impl<'a> Cursor<'a> {
         std::str::from_utf8(self.read_bytes()?).map_err(|_| self.err())
     }
 
-    /// Exactly `n` bytes, with no length prefix of their own — for a length
-    /// already known from elsewhere (e.g. a field read just before this one).
-    pub fn read_exact(&mut self, n: usize) -> Result<&'a [u8]> {
-        self.take(n)
-    }
-
     /// Advance past `n` bytes without reading them — for skipping data a
     /// caller doesn't need (e.g. positions, when only a document count is
     /// wanted) without paying to decode and allocate it.
