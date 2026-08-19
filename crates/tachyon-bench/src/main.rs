@@ -104,6 +104,37 @@ struct Args {
     /// How long `--concurrency` hammers the shared collection.
     #[arg(long, default_value_t = 10)]
     concurrency_duration_secs: u64,
+
+    /// Attempt a merge once a collection holds more than this many committed
+    /// segments — see `EngineConfig::merge_trigger_segments`. Applies to the
+    /// main Indexing/Search section and `--flush-scenario`; the default
+    /// matches `EngineConfig::default()` so omitting this flag changes
+    /// nothing about existing runs.
+    #[arg(long, default_value_t = 8)]
+    merge_trigger_segments: usize,
+
+    /// How many segments one merge folds together — see
+    /// `EngineConfig::merge_fan_in`.
+    #[arg(long, default_value_t = 4)]
+    merge_fan_in: usize,
+
+    /// Also run a merge scenario: index into a collection with auto-merge
+    /// disabled until several segments have accumulated, then explicitly
+    /// call `Collection::merge()` in a loop, reporting each merge's own wall
+    /// time and RSS delta — the number the streaming merge rewrite exists to
+    /// shrink, isolated from indexing and query traffic so it isn't averaged
+    /// away against everything else a full run does.
+    #[arg(long)]
+    merge_scenario: bool,
+
+    /// Documents per segment for `--merge-scenario`'s setup phase (i.e. its
+    /// own `--max-memtable-docs`), and the fan-in each explicit merge call
+    /// folds together.
+    #[arg(long, default_value_t = 100_000)]
+    merge_scenario_segment_docs: usize,
+
+    #[arg(long, default_value_t = 4)]
+    merge_scenario_fan_in: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -121,7 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Unbounded by default: the whole corpus stays in one memtable so this
     // measures the index, not the flush policy. Override with
     // `--max-memtable-docs` to measure against on-disk segments instead.
-    let config = config.with_max_memtable_docs(args.max_memtable_docs);
+    let config = config
+        .with_max_memtable_docs(args.max_memtable_docs)
+        .with_merge_trigger_segments(args.merge_trigger_segments)
+        .with_merge_fan_in(args.merge_fan_in);
 
     println!("Tachyon benchmark");
     println!("  documents   {}", args.documents);
@@ -246,6 +280,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.concurrency > 0 {
         run_concurrency_scenario(&args)?;
     }
+
+    if args.merge_scenario {
+        run_merge_scenario(&args)?;
+    }
+
+    Ok(())
+}
+
+/// Index enough documents to accumulate several on-disk segments with
+/// auto-merge disabled, then call `Collection::merge()` explicitly, once per
+/// `--merge-scenario-fan-in` segments, reporting each call's own wall time
+/// and RSS delta. Isolates the merge path's cost from indexing throughput
+/// and query latency, which the main run's aggregate numbers average it into.
+fn run_merge_scenario(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let segments = args.documents.div_ceil(args.merge_scenario_segment_docs).max(2);
+    println!("Merge scenario");
+    println!("  segments                {segments}");
+    println!("  docs/segment            {}", args.merge_scenario_segment_docs);
+    println!("  merge fan-in            {}", args.merge_scenario_fan_in);
+    println!();
+
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::new(dir.path());
+    layout.initialize()?;
+    let config = EngineConfig::new(dir.path())
+        .with_sync_policy(SyncPolicy::Interval(Duration::from_millis(200)))
+        .with_max_memtable_docs(args.merge_scenario_segment_docs)
+        // Disabled during setup: every flush should produce its own
+        // segment, not have some folded together before the loop below
+        // gets to measure a merge call's cost in isolation.
+        .with_merge_trigger_segments(usize::MAX)
+        .with_merge_fan_in(args.merge_scenario_fan_in);
+
+    let collection = Collection::create(&layout, corpus::schema("products"), &config)?;
+
+    // One `flush()` call per segment, explicitly — rather than relying on
+    // `max_memtable_docs` to trip mid-batch, which it may not: a flush
+    // check that only runs once per `upsert_batch` call (not per document)
+    // would otherwise let one large batch land entirely in a single
+    // segment regardless of the threshold, defeating the "several separate
+    // segments" setup this scenario needs.
+    let mut rng = Rng::new(args.seed);
+    let mut indexed = 0usize;
+    for _ in 0..segments {
+        let mut this_segment = 0usize;
+        while this_segment < args.merge_scenario_segment_docs {
+            let this_batch = args.batch_size.min(args.merge_scenario_segment_docs - this_segment);
+            let batch: Vec<_> = (0..this_batch)
+                .map(|i| corpus::document(&mut rng, indexed + i, args.vocab_scale))
+                .collect();
+            let report = collection.upsert_batch(batch)?;
+            if report.num_failed > 0 {
+                return Err(format!("{} documents failed to index", report.num_failed).into());
+            }
+            indexed += this_batch;
+            this_segment += this_batch;
+        }
+        collection.flush()?;
+    }
+    collection.sync()?;
+    println!("  segments after setup    {}", collection.stats().num_segments);
+    println!();
+
+    let mut merge_times_ms = Vec::new();
+    let mut rss_deltas = Vec::new();
+    loop {
+        let rss_before = current_rss_bytes();
+        let started = Instant::now();
+        let merged = collection.merge()?;
+        let elapsed = started.elapsed();
+        if !merged {
+            break;
+        }
+        merge_times_ms.push(elapsed.as_secs_f64() * 1000.0);
+        if let (Some(before), Some(after)) = (rss_before, current_rss_bytes()) {
+            rss_deltas.push(after as i64 - before as i64);
+        }
+    }
+
+    if merge_times_ms.is_empty() {
+        println!("  no merges ran — need at least `merge_fan_in` segments to fold together");
+        println!();
+        return Ok(());
+    }
+
+    let mean_ms = merge_times_ms.iter().sum::<f64>() / merge_times_ms.len() as f64;
+    let max_ms = merge_times_ms.iter().cloned().fold(0.0, f64::max);
+    println!("  merges run              {}", merge_times_ms.len());
+    println!("  mean merge time         {mean_ms:.1} ms");
+    println!("  max merge time          {max_ms:.1} ms");
+    if !rss_deltas.is_empty() {
+        let mean_delta = rss_deltas.iter().sum::<i64>() as f64 / rss_deltas.len() as f64;
+        let max_delta = rss_deltas.iter().cloned().max().unwrap_or(0);
+        println!("  mean RSS delta/merge    {}", human_bytes_signed(mean_delta as i64));
+        println!("  max RSS delta/merge     {}", human_bytes_signed(max_delta));
+    }
+    println!("  segments after merging  {}", collection.stats().num_segments);
+    println!("  rss (peak)              {}", human_bytes(peak_rss_bytes()));
+    println!();
 
     Ok(())
 }
@@ -541,4 +674,14 @@ fn human_bytes(bytes: usize) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+/// Same as [`human_bytes`], but for a signed delta — `current_rss_bytes()`
+/// can fall as well as rise between two samples.
+fn human_bytes_signed(bytes: i64) -> String {
+    if bytes < 0 {
+        format!("-{}", human_bytes(bytes.unsigned_abs() as usize))
+    } else {
+        format!("+{}", human_bytes(bytes as usize))
+    }
 }

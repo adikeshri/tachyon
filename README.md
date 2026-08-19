@@ -14,10 +14,7 @@ minutes. It is not a vector database and not a RAG engine; it does one thing.
 docker run -p 8108:8108 ghcr.io/tachyon-search/tachyon:latest
 ```
 
-> See [Known limitations](#known-limitations) before you rely on it — in
-> particular, **a merge briefly holds everything it's folding together in
-> memory at once**, a real cost worth accounting for when tuning
-> `--merge-fan-in` on a memory-constrained deployment.
+> See [Known limitations](#known-limitations) before you rely on it.
 
 ---
 
@@ -102,18 +99,20 @@ broader than real traffic, and deliberately so, because it is the expensive case
 
 | | 100k documents | 1M documents | 5M documents | Target |
 |---|---|---|---|---|
-| Search p95 | **3.6 ms** | 31.6 ms | 160.3 ms | < 30 ms |
-| Search p99 | **4.3 ms** | 34.3 ms | 171.5 ms | < 60 ms |
-| Autocomplete p95 | **0.35 ms** | 0.24 ms | 1.4 ms | < 5 ms |
-| Indexing | **182k docs/sec** | 140k docs/sec | 50k docs/sec | 10k docs/sec |
-| Memory (steady RSS) | 403 MiB | 968 MiB | 3.4 GiB | — |
-| Memory (peak RSS) | 403 MiB | 999 MiB | 5.2 GiB | — |
+| Search p95 | **3.4 ms** | 34.4 ms | 175.1 ms | < 30 ms |
+| Search p99 | **4.0 ms** | 35.5 ms | 181.7 ms | < 60 ms |
+| Autocomplete p95 | **0.29 ms** | 0.23 ms | 1.8 ms | < 5 ms |
+| Indexing | **196k docs/sec** | 145k docs/sec | 88k docs/sec | 10k docs/sec |
+| Memory (steady RSS) | 405 MiB | 606 MiB | 895 MiB | — |
+| Memory (peak RSS) | 405 MiB | 646 MiB | 1.5 GiB | — |
 
 Both measured right after indexing finishes, before any searches run. Steady
 is current RSS at that point — what's resident most of the time. Peak is
 `getrusage`'s kernel-tracked high-water mark since process start, which also
-catches any transient spike indexing passed through on the way there; at 5M
-documents the two diverge meaningfully; at 100k they don't.
+catches any transient spike indexing passed through on the way there; at 100k
+documents the whole corpus stays in one memtable (no segment ever gets
+written), so steady and peak are identical there by construction, not
+coincidence.
 
 Reproduce:
 
@@ -121,11 +120,15 @@ Reproduce:
 cargo run --release -p tachyon-bench -- --documents 1000000 --queries 2000
 ```
 
-Indexing throughput beats the target by more than an order of magnitude, and
-autocomplete now clears its target at every scale measured. Search meets the
-latency target at 100k documents; at 1M it misses by a hair (31.6 ms vs. the
-30 ms target) and at 5M it still misses by a wide margin **on this corpus**;
-see [Known limitations](#known-limitations).
+Indexing throughput beats the target by nearly an order of magnitude at 5M
+documents and more at smaller scales, and autocomplete clears its target at
+every scale measured. Search meets the latency target at 100k documents; at
+1M and 5M it misses **on this corpus** — see
+[Known limitations](#known-limitations) — but memory no longer moves in
+lockstep with corpus size the way it used to: peak RSS at 5M documents fell
+from 5.2 GiB to 1.5 GiB after the streaming segment writer and merge
+described below replaced a design that rebuilt each merge's input through a
+scratch in-memory index before re-encoding it.
 
 ---
 
@@ -133,25 +136,30 @@ see [Known limitations](#known-limitations).
 
 Read this before choosing Tachyon.
 
-**A merge briefly holds what it's merging fully in memory.** Writes are
-durable — they go to a write-ahead log and are replayed on startup — and
-once a memtable crosses `--max-memtable-docs`/`--max-memtable-bytes` it is
-flushed into an immutable, mmap'd on-disk segment: postings, columns, and
-document values are all read lazily and decoded only for what a query
-actually touches, which is what keeps memory bounded by how much of the
-corpus is hot rather than by corpus size. A query fans out across the
-memtable plus every committed segment, so segment count on its own drives
-latency up over time; once a collection holds more than
-`--merge-trigger-segments` (default 8), the smallest `--merge-fan-in`
-(default 4) are folded into one right after the flush that crossed that
-line. The trade: a merge rebuilds its input through a scratch memtable
-before re-encoding it, so it briefly holds everything being merged decoded
-at once — measured peak RSS during a 1M-doc run was ~1.5 GiB captured
-mid-merge, settling to ~49 MiB once indexing (including that merge)
-finished. Real, worth accounting for when tuning `--merge-fan-in` on a
-memory-constrained deployment, but momentary, not sustained. A direct
-merge of the already-encoded structures, avoiding the scratch memtable
-entirely, is the natural follow-up if this proves to matter in practice.
+**A merge still costs a stop-the-world pause on the collection's write
+lock, shrunk but not eliminated.** Writes are durable — they go to a
+write-ahead log and are replayed on startup — and once a memtable crosses
+`--max-memtable-docs`/`--max-memtable-bytes` it is flushed into an
+immutable, mmap'd on-disk segment: postings, columns, and document values
+are all read lazily and decoded only for what a query actually touches,
+which is what keeps memory bounded by how much of the corpus is hot rather
+than by corpus size. A query fans out across the memtable plus every
+committed segment, so segment count on its own drives latency up over time;
+once a collection holds more than `--merge-trigger-segments` (default 8),
+the smallest `--merge-fan-in` (default 4) are folded into one right after
+the flush that crossed that line, via a streaming k-way merge of the
+victims' already-encoded term dictionaries, postings, columns, and doc
+stores — no document is ever re-parsed or re-tokenized, and nothing beyond
+one term's or one field's worth of data is held in memory at a time. That
+made the biggest cost — a merge holding everything it was folding together
+decoded at once — go away: measured on a 1M-document, four-segment merge,
+each merge's own RSS delta averaged ~93 MiB and peaked at ~110 MiB, and a
+5M-document run's overall peak RSS fell from 5.2 GiB to 1.5 GiB. What's
+left is that the merge still runs synchronously under the write lock, so
+every search stalls for its duration — the streaming rewrite shrank that
+stall (a 1M-document flush-under-load run's worst-case concurrent search
+latency fell from 3.7 s to 1.9 s) but did not remove it, since running a
+merge off the lock entirely is a separate project this one didn't attempt.
 
 **Broad queries no longer visit every match unconditionally.** A block-level
 score bound (true block-max WAND, `.post`'s v3 format) now skips whole

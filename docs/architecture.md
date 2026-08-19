@@ -112,12 +112,22 @@ A flush turns a memtable into five immutable files — `<id>.terms`, `<id>.ids`,
 structure rather than one shared blob, so postings, columns, and the document
 store can each use whatever layout suits them without agreeing on a common
 framing. `.terms` and `.ids` are `fst::Map`s (term → dense id, and user id →
-doc id); `.post`, `.col`, and `.doc` each carry a small eager header — an
-offset table, essentially — followed by the data it points into.
+doc id), streamed directly through `fst::MapBuilder` as terms/ids are
+visited in sorted order. `.post`, `.col`, and `.doc` each open with a 12-byte
+header (a magic string and the format version) and close with a small
+footer — an offset table, essentially — whose own position is named by the
+file's last 8 bytes. The footer sits at the *end* rather than the front on
+purpose: a writer can then stream payload bytes forward as it produces them
+and only needs the directory's contents, never its file position, once
+everything before it is already written — which is what lets both a flush
+and a merge (see "Merges" below) write a segment in bounded memory, without
+ever holding the whole thing assembled first. Nothing about *reading* a
+segment cares where the footer sits; mmap makes every byte in the file
+equally cheap to reach regardless.
 
 Every file is mmap'd, and every read decodes only what it was asked for:
 
-- **`.post`**: the header holds per-field corpus stats and a byte offset per
+- **`.post`**: the footer holds per-field corpus stats and a byte offset per
   term. A query resolves a term through `.terms`' FST to a dense id, then
   decodes just that one term's block — nothing else in the file is touched.
   `doc_freq`/`live_doc_freq` go further still: they only ever need a document
@@ -125,7 +135,7 @@ Every file is mmap'd, and every read decodes only what it was asked for:
   position arrays instead of decoding and allocating them — the difference
   matters because autocomplete calls both across every candidate term and
   every source.
-- **`.col`**: the header is a small per-field directory (tag, offset,
+- **`.col`**: the footer is a small per-field directory (tag, offset,
   length). A query decodes one field's column — reusing
   `NumericColumn`/`KeywordColumn` verbatim via `from_sorted`/`from_parts` —
   never the whole file.
@@ -265,29 +275,34 @@ down over several flushes rather than in one large pause.
 **A merge renumbers documents, it does not preserve their ids.** A segment's
 doc-id range is fixed for its life (see "Segments" above), so folding two
 already-committed segments together while keeping their original ids would
-mean merging two already-*encoded* structures — a from-scratch k-way merge of
-sorted term dictionaries and postings. Renumbering sidesteps that entirely:
-a merge fetches each live, non-tombstoned document's source through
-`SegmentReader::get`, runs it back through `ParsedDocument::parse` — the
-exact validation and tokenization a fresh insert already does — and feeds
-the result into a scratch `MemTable`, then calls the ordinary `encode` on
-it. The entire insert/encode pipeline is reused unchanged; the only new
-code is picking victims and updating the commit state. Retired ids are
-simply never claimed again, and any tombstones for them are pruned from
-`state.json`'s `deleted` list as part of the merge's own commit, the same
-way a flush's own commit is the point of no return.
+mean merging two already-*encoded* structures anyway, just without the
+freedom to renumber — old ids would have to be preserved gap-for-gap. Since
+renumbering was going to happen either way, `tachyon_index::merge_segments`
+(`crates/tachyon-index/src/segment/merge.rs`) does the direct merge instead:
+a streaming k-way union of the victims' term dictionaries (`fst::map::OpBuilder`)
+and postings, columns, and doc-store rows, with every surviving id remapped
+as it goes (see the module's own doc comment for the exact rank-based
+remapping). Nothing here re-parses a document's source or re-tokenizes its
+text — that work already happened once, when each victim was first flushed.
+A `Null`/`Bool`/`Int`/`Float` value slot is copied as 13 raw bytes with no
+decode at all; a `Str`/`Array` slot's blob bytes and a document's stored
+source JSON are copied verbatim, with only offsets rebased to the new
+file's positions. Only postings are actually decoded, and only because
+block boundaries genuinely shift once dead documents drop out and ids
+change. Retired ids are simply never claimed again, and any tombstones for
+them are pruned from `state.json`'s `deleted` list as part of the merge's
+own commit, the same way a flush's own commit is the point of no return.
 
-The cost of that reuse is a **transient memory spike while a merge is in
-flight**: rebuilding `merge_fan_in` segments' worth of live documents into a
-scratch memtable before encoding it means the merge briefly holds all of
-them decoded at once, proportional to `merge_fan_in × segment size` rather
-than to the corpus as a whole. Measured directly: peak RSS during a 1M-doc
-run with default settings was ~1.5 GiB captured mid-merge, but memory back
-at rest immediately after indexing finished (no merge in flight, no queries
-yet run) was ~49 MiB. It's a real, momentary cost worth accounting for when
-sizing `merge_fan_in` on a memory-constrained deployment — smaller values
-trade a bigger memory ceiling for more frequent, cheaper merges — but it is
-not sustained.
+Memory stays bounded by what one term-field's postings, one field's column,
+or one document's blob bytes need — never by corpus size or by
+`merge_fan_in × segment size`. Measured directly on a 1M-document
+collection (four 250k-document segments, `merge_fan_in=4`): each merge's own
+RSS delta averaged **~93 MiB**, peaking at **~110 MiB**, and a run's overall
+indexing peak RSS (four flushes plus the merges they triggered) fell from
+999 MiB to **646 MiB** compared to the pre-streaming merge — a genuine,
+sustained reduction, not just a shorter spike. `--merge-fan-in` still trades
+frequency against average merge cost the same way it always did; it no
+longer trades against a memory ceiling that scaled with the merge itself.
 
 ## Score-bound pruning
 
@@ -313,7 +328,7 @@ first place — see below for what does.
 Classical block-max WAND skips documents entirely, jumping ahead in sorted
 posting lists using per-block score bounds — incompatible with the exact
 counts the mechanism above preserves. This is now built as a genuinely
-separate, composed layer: `.post`'s v3 format groups a term's postings into
+separate, composed layer: `.post`'s format groups a term's postings into
 fixed 128-document blocks, each carrying its own max doc id, max term
 frequency, and byte offset, so a query can skip — or jump straight past — a
 whole block without decoding a single posting inside it. A lazy
@@ -353,10 +368,15 @@ bound check ever runs.
 
 ## What is not built yet
 
-**Streaming merges.** A merge currently rebuilds its input through a scratch
-memtable rather than merging the already-encoded structures directly, which
-is what causes the transient memory spike above. A direct k-way merge of
-sorted term dictionaries, columns, and doc stores across segments would
-avoid materializing anything beyond what's being written — real, novel code
-this workspace doesn't have yet, deferred until the spike above is shown to
-matter in practice.
+**Off-lock merging.** A merge still runs synchronously under the same
+write-lock hold as the flush that triggered it, so every search stalls for
+its duration — shrunk a great deal by the streaming rewrite above (no more
+re-parsing or re-tokenizing every merged document, no more materializing
+the whole merge in memory before writing it), but not eliminated. Segments
+are immutable and a merge only ever reads its victims, so in principle the
+bulk of a merge's work could run entirely outside the lock, taking it only
+for the final state swap — the real complication is a delete landing on a
+victim while its merge is still in flight, which has to be re-checked
+against the collection's tombstones and remapped into the new id space at
+swap time rather than silently resurrected. Deferred until the streaming
+merge's own remaining stall is shown to matter in practice.
