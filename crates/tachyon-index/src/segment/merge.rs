@@ -70,6 +70,16 @@ pub struct MergeInput<'a> {
 pub struct MergeStats {
     /// Total documents written to the output segment.
     pub doc_count: usize,
+    /// Each input's own slice of the output range: input `i`'s surviving
+    /// documents landed at `new_base[i]..new_base[i] + inputs[i].live.len()`.
+    /// Exposed so a caller that captured its own copy of `inputs[i].live`
+    /// (`tachyon-engine`'s off-lock merge does, to remap a tombstone that
+    /// lands on a victim after this snapshot was taken but before the merge
+    /// commits) can reproduce the exact same `old_id -> new_id` mapping
+    /// [`remap`] used internally, without this module and its caller
+    /// silently drifting out of sync over two independent implementations
+    /// of the same formula.
+    pub new_base: Vec<DocId>,
 }
 
 /// Stream `inputs` into one segment starting at doc id `base`, writing
@@ -113,7 +123,7 @@ pub fn merge_segments(
     merge_columns(inputs, &new_base, schema, col_w)?;
     merge_docs(inputs, &new_base, schema, base, out_end, doc_w)?;
 
-    Ok(MergeStats { doc_count })
+    Ok(MergeStats { doc_count, new_base })
 }
 
 /// `old_id`'s new id under input `i`, or `None` if it didn't survive.
