@@ -21,7 +21,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::Value as Json;
@@ -29,8 +29,8 @@ use utoipa::ToSchema;
 
 use tachyon_core::{CollectionSchema, DocId, Error, ParsedDocument, Result};
 use tachyon_index::{
-    encode_streaming, merge_segments, IndexSource, MemTable, MergeInput, SegmentFilePaths,
-    SegmentReader,
+    encode_streaming, merge_segments, IndexSource, MemTable, MergeInput, MergeStats,
+    SegmentFilePaths, SegmentReader,
 };
 use tachyon_query::{
     compute_facets, execute, suggest, Hit, SearchContext, SearchParams, SearchRequest,
@@ -148,6 +148,35 @@ impl SegmentFiles {
     }
 }
 
+/// Everything an off-lock merge's build phase (`Collection::build_merge`)
+/// needs, captured under the write lock (`Collection::snapshot_merge_locked`)
+/// so nothing about which documents are being merged, or which output ids
+/// they'll land at, can change while that phase runs without holding it.
+struct MergeSnapshot {
+    /// Reserved from `state.next_segment_id` at snapshot time — see
+    /// `snapshot_merge_locked`'s doc comment for why that can't wait.
+    segment_id: u64,
+    /// Reserved from the active memtable's `next_doc_id()` at snapshot
+    /// time, for the same reason.
+    merge_base: DocId,
+    /// Total live documents across every victim, as of the snapshot —
+    /// `sum(live[i].len())`. Also the size of the range reserved at
+    /// `merge_base`, whether or not a document later gets tombstoned before
+    /// the merge commits (see `swap_merge_locked`'s tombstone remap).
+    claimed: DocId,
+    victim_refs: Vec<SegmentRef>,
+    /// Kept alive so the build phase can read from them; also pins the
+    /// underlying files against deletion, though nothing else in this
+    /// codebase ever deletes a segment's files except a merge retiring its
+    /// own victims, and `merge_gate` guarantees only one merge is ever in
+    /// flight.
+    victim_readers: Vec<Arc<SegmentReader>>,
+    /// Each victim's own surviving doc ids as of this snapshot — needed
+    /// again at swap time to remap any tombstone that lands on one of them
+    /// while the build phase is running (see `swap_merge_locked`).
+    live: Vec<RoaringBitmap>,
+}
+
 /// Per-document result of a batch write. A batch is not all-or-nothing: PRD
 /// §7.2 requires atomicity *per document*, so one malformed document does not
 /// reject its neighbours.
@@ -224,6 +253,15 @@ pub struct Collection {
     layout: Layout,
     config: EngineConfig,
     inner: RwLock<Inner>,
+    /// Held for the duration of a merge's build phase (see `run_merge`), so
+    /// at most one merge is ever in flight — `inner`'s write lock is
+    /// deliberately *not* held for that whole duration, which is the entire
+    /// point of an off-lock merge, so it can no longer serialize merges
+    /// against each other the way it used to. `merge()` (an explicit,
+    /// caller-requested merge) blocks on this; `maybe_merge()` (the
+    /// automatic post-write check) uses `try_lock` and simply skips if a
+    /// merge is already running — the next write will check again.
+    merge_gate: Mutex<()>,
 }
 
 impl Collection {
@@ -306,6 +344,7 @@ impl Collection {
             layout: layout.clone(),
             config: config.clone(),
             inner: RwLock::new(Inner { state, wal, memtable, segments, deleted, next_seq }),
+            merge_gate: Mutex::new(()),
         })
     }
 
@@ -332,35 +371,39 @@ impl Collection {
         }
 
         if !accepted.is_empty() {
-            let mut inner = self.inner.write();
-
-            let first_seq = inner.next_seq;
-            let records: Vec<WalRecordRef> = accepted
-                .iter()
-                .enumerate()
-                .map(|(n, (_, parsed))| WalRecordRef::Upsert {
-                    seq: first_seq + n as u64,
-                    doc: &parsed.source,
-                })
-                .collect();
-
-            // Durable before acknowledged. If this fails nothing has been
-            // applied, so the batch is cleanly rejected.
-            inner.wal.append_batch(&records)?;
-            inner.next_seq = first_seq + accepted.len() as u64;
-
             {
-                let Inner { memtable, deleted, segments, .. } = &mut *inner;
-                for (i, parsed) in accepted {
-                    let id = parsed.id.clone();
-                    Self::apply_upsert(memtable, deleted, segments, parsed);
-                    results[i] = Some(DocOutcome::ok(id));
-                }
-            }
+                let mut inner = self.inner.write();
 
-            if Self::needs_flush_locked(&inner, &self.config) {
-                Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
-            }
+                let first_seq = inner.next_seq;
+                let records: Vec<WalRecordRef> = accepted
+                    .iter()
+                    .enumerate()
+                    .map(|(n, (_, parsed))| WalRecordRef::Upsert {
+                        seq: first_seq + n as u64,
+                        doc: &parsed.source,
+                    })
+                    .collect();
+
+                // Durable before acknowledged. If this fails nothing has been
+                // applied, so the batch is cleanly rejected.
+                inner.wal.append_batch(&records)?;
+                inner.next_seq = first_seq + accepted.len() as u64;
+
+                {
+                    let Inner { memtable, deleted, segments, .. } = &mut *inner;
+                    for (i, parsed) in accepted {
+                        let id = parsed.id.clone();
+                        Self::apply_upsert(memtable, deleted, segments, parsed);
+                        results[i] = Some(DocOutcome::ok(id));
+                    }
+                }
+
+                if Self::needs_flush_locked(&inner, &self.config) {
+                    Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
+                }
+            } // write lock released before a merge is even considered
+
+            self.maybe_merge();
         }
 
         let results: Vec<DocOutcome> = results
@@ -381,24 +424,29 @@ impl Collection {
 
     /// Delete by id. Returns `false` if no such document existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
-        let mut inner = self.inner.write();
-        if Self::lookup(&inner, id).is_none() {
-            return Ok(false);
-        }
-
-        let seq = inner.next_seq;
-        inner.wal.append(&WalRecordRef::Delete { seq, id })?;
-        inner.next_seq = seq + 1;
-
         let removed = {
-            let Inner { memtable, deleted, segments, .. } = &mut *inner;
-            Self::apply_delete(memtable, deleted, segments, id)
-        };
+            let mut inner = self.inner.write();
+            if Self::lookup(&inner, id).is_none() {
+                return Ok(false);
+            }
 
-        if Self::needs_flush_locked(&inner, &self.config) {
-            Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
-        }
+            let seq = inner.next_seq;
+            inner.wal.append(&WalRecordRef::Delete { seq, id })?;
+            inner.next_seq = seq + 1;
 
+            let removed = {
+                let Inner { memtable, deleted, segments, .. } = &mut *inner;
+                Self::apply_delete(memtable, deleted, segments, id)
+            };
+
+            if Self::needs_flush_locked(&inner, &self.config) {
+                Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
+            }
+
+            removed
+        }; // write lock released before a merge is even considered
+
+        self.maybe_merge();
         Ok(removed)
     }
 
@@ -499,17 +547,29 @@ impl Collection {
     /// [`EngineConfig::max_memtable_docs`] or `max_memtable_bytes`; exposed
     /// directly for tests and for an operator forcing an early flush.
     pub fn flush(&self) -> Result<bool> {
-        let mut inner = self.inner.write();
-        Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)
+        let flushed = {
+            let mut inner = self.inner.write();
+            Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?
+        }; // write lock released before a merge is even considered
+        self.maybe_merge();
+        Ok(flushed)
     }
 
-    /// Force a merge check right now, if segment count crosses the
-    /// configured threshold. Ordinarily triggered automatically right after
-    /// a flush; exposed directly for tests and for an operator forcing one
-    /// early. Returns whether a merge actually happened.
+    /// Force a merge right now, regardless of `merge_trigger_segments`
+    /// (though a merge still requires at least `merge_fan_in` segments to
+    /// have anything to fold together) — exposed directly for tests and for
+    /// an operator forcing one early. Returns whether a merge actually
+    /// happened.
+    ///
+    /// Blocks on `merge_gate` rather than skipping if one is already in
+    /// flight: unlike the automatic post-write check, a caller reaching for
+    /// this method explicitly wants a merge to have happened by the time it
+    /// returns, so waiting for an in-progress one and then deciding fresh
+    /// whether another is still needed is the right behavior here, not
+    /// giving up.
     pub fn merge(&self) -> Result<bool> {
-        let mut inner = self.inner.write();
-        Self::merge_locked(&mut inner, &self.schema, &self.layout, &self.config)
+        let _gate = self.merge_gate.lock();
+        self.run_merge()
     }
 
     /// Data directory this collection occupies.
@@ -563,6 +623,28 @@ impl Collection {
         let new_wal =
             Wal::open(layout.wal_file(&schema.name, new_wal_generation), config.sync_policy)?;
 
+        // The memtable's own `base()`/`next_doc_id()` span every id it was
+        // ever handed, live or not — including holes an off-lock merge
+        // reserved on it (`snapshot_merge_locked`) that this flush's own
+        // inserts never filled. Declaring those as part of this segment's
+        // range would make it overlap another segment's — the merge output
+        // that reserved them declares the very same ids as its own. A
+        // single forward pass over what's actually live finds the true
+        // bounds; an entirely dead memtable (every doc since the last
+        // flush was also deleted — `heap_bytes()`-driven flushing can still
+        // trigger this) has no live doc to anchor on, so it falls back to
+        // the full span, which is harmless there since nothing is ever
+        // live in it for another segment to collide with.
+        let mut live_span: Option<(DocId, DocId)> = None;
+        for (id, _) in inner.memtable.iter() {
+            live_span = Some(match live_span {
+                Some((first, _)) => (first, id),
+                None => (id, id),
+            });
+        }
+        let (min_doc_id, max_doc_id) =
+            live_span.unwrap_or((inner.memtable.base(), inner.memtable.next_doc_id() - 1));
+
         let mut new_state = inner.state.clone();
         new_state.next_segment_id += 1;
         new_state.next_doc_id = inner.memtable.next_doc_id();
@@ -572,8 +654,8 @@ impl Collection {
         new_state.segments.push(SegmentRef {
             id: segment_id,
             doc_count: inner.memtable.len() as u32,
-            min_doc_id: inner.memtable.base(),
-            max_doc_id: inner.memtable.next_doc_id() - 1,
+            min_doc_id,
+            max_doc_id,
         });
 
         // The commit point: a crash before this leaves the previous state
@@ -597,10 +679,11 @@ impl Collection {
         // after is just a harmless leftover file.
         old_wal.remove()?;
 
-        if Self::needs_merge_locked(inner, config) {
-            Self::merge_locked(inner, schema, layout, config)?;
-        }
-
+        // Deliberately not triggering a merge from here: this runs under
+        // the write lock, and a merge's own build phase must not (see
+        // `run_merge`'s doc comment) — every caller of `flush_locked` is
+        // responsible for calling `self.maybe_merge()` itself, once its own
+        // lock scope has ended.
         Ok(true)
     }
 
@@ -608,48 +691,96 @@ impl Collection {
         inner.state.segments.len() > config.merge_trigger_segments
     }
 
-    /// Folds the `merge_fan_in` smallest segments (by document count) into
-    /// one. Runs under the same write-lock acquisition as the flush that
-    /// triggered it, immediately after that flush's own commit — same
-    /// reasoning as `flush_locked`'s doc comment: one lock, one commit
-    /// point, no window where a concurrent write could observe a
-    /// half-finished state.
+    /// Best-effort: run a merge if one is due and none is already in
+    /// flight. Called after every write's own lock scope has ended — never
+    /// from inside one, and never while `inner`'s write lock is held (see
+    /// `run_merge`'s doc comment for why that matters).
     ///
-    /// A merge renumbers rather than preserves doc ids. `SegmentRef`'s
-    /// range is fixed for a segment's life and doc ids are never reused, so
-    /// preserving the originals across a merge would mean building a new
-    /// on-disk segment out of two *already-encoded* ones — which, since
-    /// `tachyon_index::merge_segments`, is exactly what this does: a
-    /// streaming k-way merge of the victims' term dictionaries, postings,
-    /// columns, and doc stores, straight into the output segment's five
-    /// files. Renumbering is still required (the union of two segments'
-    /// doc id ranges is never itself contiguous once dead documents drop
-    /// out), so this still picks victims and remaps every surviving id, but
-    /// nothing here re-parses a document's source or re-tokenizes its text
-    /// — that work already happened once, when each victim was first
-    /// flushed, and a merge's job is to copy it forward, not redo it. Doc
-    /// ids retired this way are simply never claimed again — no segment or
-    /// memtable ever covers that range afterward — except that
-    /// `inner.deleted` can hold stale tombstones for them, which this
-    /// prunes explicitly.
+    /// Errors are logged, not propagated. By the time this runs, the write
+    /// that triggered the check has already durably succeeded (its WAL
+    /// record is fsynced, its memtable insert applied, any flush it needed
+    /// committed) — a merge is background bookkeeping on top of that, and a
+    /// failure in it must not make an already-successful write look like it
+    /// failed to the caller. `merge()` (the explicit, caller-requested
+    /// form) still returns its `Result` directly, for exactly the opposite
+    /// reason: a caller reaching for that method wants to know.
+    fn maybe_merge(&self) {
+        // Cheap precheck under a read lock, before even touching
+        // `merge_gate`: the common case, after most writes, is that no
+        // merge is due at all, and this avoids taking the gate mutex (and
+        // paying for the `Ordering::SeqCst`-ish RMW a `try_lock` costs) on
+        // every single write for nothing.
+        if !Self::needs_merge_locked(&self.inner.read(), &self.config) {
+            return;
+        }
+        let Some(_gate) = self.merge_gate.try_lock() else { return };
+        if let Err(e) = self.run_merge() {
+            tracing::error!(
+                collection = %self.schema.name,
+                error = %e,
+                "background segment merge failed; the collection remains correct, just with \
+                 more segments than ideal until a later write triggers another attempt"
+            );
+        }
+    }
+
+    /// Runs one merge, snapshot → build → swap, start to finish. Assumes
+    /// the caller already holds `merge_gate` — `merge()` and `maybe_merge()`
+    /// are the only two callers, and both take it before calling this.
     ///
-    /// A no-op, not an error, when there are fewer than `merge_fan_in`
-    /// segments to work with.
-    fn merge_locked(
-        inner: &mut Inner,
-        schema: &CollectionSchema,
-        layout: &Layout,
-        config: &EngineConfig,
-    ) -> Result<bool> {
+    /// Only the snapshot and swap stages hold `inner`'s write lock; the
+    /// build stage — encoding the merged segment, the expensive part this
+    /// whole three-stage split exists for — runs with no lock held at all,
+    /// so searches and writes proceed normally while it's in progress. See
+    /// `snapshot_merge_locked` and `swap_merge_locked` for how the two
+    /// locked stages stay correct despite everything that can happen to the
+    /// collection in between: flushes committing, documents being deleted
+    /// or superseded, and so on.
+    fn run_merge(&self) -> Result<bool> {
+        let snapshot = {
+            let mut inner = self.inner.write();
+            Self::snapshot_merge_locked(&mut inner, &self.config)
+        };
+        let Some(snapshot) = snapshot else { return Ok(false) };
+
+        let built = Self::build_merge(&snapshot, &self.schema, &self.layout)?;
+
+        let mut inner = self.inner.write();
+        Self::swap_merge_locked(&mut inner, &self.schema, &self.layout, snapshot, built)?;
+        Ok(true)
+    }
+
+    /// Stage 1: pick the `merge_fan_in` smallest segments (by document
+    /// count, ties broken by id for a deterministic choice) and reserve
+    /// everything a concurrent write could otherwise race with, before the
+    /// lock is released for the build phase:
+    ///
+    /// - **The output doc id range.** `merge_base` is the active memtable's
+    ///   own `next_doc_id()` — reserved immediately via `MemTable::reserve`,
+    ///   under this same lock hold, so no concurrent insert can land inside
+    ///   `[merge_base, merge_base + claimed)` no matter how long the build
+    ///   phase takes without the lock. This reservation survives any number
+    ///   of intervening flushes on its own: a flush that replaces
+    ///   `inner.memtable` starts the new one from `state.next_doc_id`, which
+    ///   it sets from the *old* memtable's `next_doc_id()` — already past
+    ///   this reservation by construction.
+    /// - **The output segment id.** `inner.state.next_segment_id` is bumped
+    ///   right here, the same way `flush_locked` bumps it for its own
+    ///   segment — so a concurrent flush's `SegmentRef` can never collide
+    ///   with this merge's.
+    ///
+    /// Returns `None` if there are fewer than `merge_fan_in` segments to
+    /// work with — the same no-op condition the single-lock `merge_locked`
+    /// used to check, just renamed since there's no longer one `_locked`
+    /// function to check it inside of.
+    fn snapshot_merge_locked(inner: &mut Inner, config: &EngineConfig) -> Option<MergeSnapshot> {
         if inner.state.segments.len() < config.merge_fan_in {
-            return Ok(false);
+            return None;
         }
 
-        // The `merge_fan_in` smallest by doc_count, ties broken by id for a
-        // deterministic choice. `inner.segments` and `inner.state.segments`
-        // are always the same length and order — both only ever change
-        // together, here and in `flush_locked` — so an index into one is
-        // valid for the other.
+        // `inner.segments` and `inner.state.segments` are always the same
+        // length and order — both only ever change together, here and in
+        // `flush_locked` — so an index into one is valid for the other.
         let mut by_size: Vec<usize> = (0..inner.state.segments.len()).collect();
         by_size.sort_by_key(|&i| (inner.state.segments[i].doc_count, inner.state.segments[i].id));
         let mut victims: Vec<usize> = by_size.into_iter().take(config.merge_fan_in).collect();
@@ -660,34 +791,125 @@ impl Collection {
         let victim_readers: Vec<Arc<SegmentReader>> =
             victims.iter().map(|&i| Arc::clone(&inner.segments[i])).collect();
 
-        // The range this claims must start from the *active* memtable's own
-        // `next_doc_id()`, not `inner.state.next_doc_id` — the two agree
-        // when merging runs right after a flush (the common case: the fresh
-        // memtable is still empty, so its `next_doc_id()` equals the base
-        // `state.next_doc_id` recorded for it), but a merge invoked with
-        // documents already sitting in the memtable (e.g. a manual
-        // `Collection::merge()` call) would otherwise hand out ids the
-        // memtable already assigned to those documents. Below, once this
-        // range is claimed, the memtable is told to skip over it too — see
-        // that call's comment for why.
-        let merge_base = inner.memtable.next_doc_id();
-
-        // Each victim's own surviving doc ids: its presence bitmap (already
-        // excludes anything that was a hole when it was flushed) minus
-        // whatever the collection has tombstoned since. `merge_segments`
-        // remaps every id in here to a fresh, dense, monotone range starting
-        // at `merge_base` — see its own doc comment for exactly how.
-        let merge_inputs: Vec<MergeInput> = victim_readers
+        // Each victim's own surviving doc ids as of *now*: its presence
+        // bitmap (already excludes anything that was a hole when it was
+        // flushed) minus whatever the collection has tombstoned so far.
+        // Kept in the snapshot (not just used to compute `claimed`) because
+        // `swap_merge_locked` needs this exact bitmap again, to tell which
+        // of these ids the build phase copied into the merge output before
+        // reproducing `tachyon_index::merge_segments`'s own rank-based
+        // remap for any of them that got tombstoned while that ran.
+        let live: Vec<RoaringBitmap> = victim_readers
             .iter()
             .map(|reader| {
                 let mut live = reader.presence().clone();
                 live -= &inner.deleted;
-                MergeInput { reader: reader.as_ref(), live }
+                live
             })
             .collect();
-        let claimed: DocId = merge_inputs.iter().map(|input| input.live.len() as DocId).sum();
+        let claimed: DocId = live.iter().map(|l| l.len() as DocId).sum();
 
+        // See "The output doc id range" above for why this reservation
+        // happens here, under the lock, rather than after the build phase.
+        let merge_base = inner.memtable.next_doc_id();
+        inner.memtable.reserve(claimed as usize);
+
+        // See "The output segment id" above.
+        let segment_id = inner.state.next_segment_id;
+        inner.state.next_segment_id += 1;
+
+        Some(MergeSnapshot { segment_id, merge_base, claimed, victim_refs, victim_readers, live })
+    }
+
+    /// Stage 2: the actual merge — decoding, re-blocking, and streaming the
+    /// victims' postings, columns, and doc stores into the output segment's
+    /// five files. No lock held, no `Inner` reference anywhere in this
+    /// function's signature: everything it touches either came from the
+    /// snapshot (immutable once captured) or is freshly created (the output
+    /// files). Returns `None` if every snapshotted document turned out to
+    /// be dead — nothing to write, the victims will simply disappear with
+    /// no replacement once `swap_merge_locked` commits that.
+    fn build_merge(
+        snapshot: &MergeSnapshot,
+        schema: &CollectionSchema,
+        layout: &Layout,
+    ) -> Result<Option<(SegmentFilePaths, MergeStats)>> {
+        if snapshot.claimed == 0 {
+            return Ok(None);
+        }
+
+        let merge_inputs: Vec<MergeInput> = snapshot
+            .victim_readers
+            .iter()
+            .zip(&snapshot.live)
+            .map(|(reader, live)| MergeInput { reader: reader.as_ref(), live: live.clone() })
+            .collect();
+
+        let paths = segment_file_paths(layout, &schema.name, snapshot.segment_id);
+        let mut files = SegmentFiles::create(&paths)?;
+        let stats = merge_segments(
+            &merge_inputs,
+            schema,
+            snapshot.merge_base,
+            &mut files.terms,
+            &mut files.ids,
+            &mut files.post,
+            &mut files.col,
+            &mut files.doc,
+        )?;
+        files.commit(&layout.segments_dir(&schema.name))?;
+        debug_assert_eq!(stats.doc_count as DocId, snapshot.claimed);
+
+        Ok(Some((paths, stats)))
+    }
+
+    /// Stage 3: commit the merge, re-validated against whatever changed
+    /// concurrently while the build phase ran without the lock — a flush
+    /// committing a new segment, a document being deleted or superseded,
+    /// or both.
+    ///
+    /// A merge renumbers rather than preserves doc ids — see
+    /// `tachyon_index::merge_segments`'s own doc comment for the exact
+    /// rank-based mapping, and `snapshot_merge_locked`'s doc comment for why
+    /// the range it claims can never collide with anything else. Doc ids
+    /// retired this way are simply never claimed again — no segment or
+    /// memtable ever covers that range afterward.
+    fn swap_merge_locked(
+        inner: &mut Inner,
+        schema: &CollectionSchema,
+        layout: &Layout,
+        snapshot: MergeSnapshot,
+        built: Option<(SegmentFilePaths, MergeStats)>,
+    ) -> Result<()> {
+        // Freshly cloned *now*, not reused from anything computed at
+        // snapshot time: a concurrent flush may have committed a new
+        // segment, advanced `next_doc_id`, or added tombstones while the
+        // build phase above ran without the lock, and every bit of that
+        // must survive into this merge's own commit rather than being
+        // silently discarded by committing a state clone taken before it
+        // happened.
         let mut new_state = inner.state.clone();
+
+        // Every id this snapshot considered live that has since been
+        // deleted — by a plain delete, or by an upsert superseding it with
+        // a new version — needs a tombstone under its *new* id: the
+        // document was already copied into the merge output at snapshot
+        // time (`build_merge` had no way to know it wouldn't be), and
+        // nothing un-copies it now. `snapshot.live` is exactly the bitmap
+        // `tachyon_index::merge_segments` remapped from, so intersecting it
+        // against the tombstones that have landed since snapshot, then
+        // reproducing that same rank-based formula, recovers precisely
+        // which new ids need tombstoning.
+        let mut new_tombstones = RoaringBitmap::new();
+        if let Some((_, stats)) = &built {
+            for (i, live) in snapshot.live.iter().enumerate() {
+                let now_dead = live & &inner.deleted;
+                for old_id in now_dead.iter() {
+                    let new_id = stats.new_base[i] + (live.rank(old_id) - 1) as DocId;
+                    new_tombstones.insert(new_id);
+                }
+            }
+        }
 
         // Tombstones for ids no segment will ever claim again — the merge
         // output starts fresh, so nothing later needs to know these were
@@ -695,56 +917,78 @@ impl Collection {
         // serialized snapshot: `stats()` subtracts `inner.deleted.len()`
         // from the summed segment doc counts, and a stale entry for an id
         // no segment counts anymore would silently undercount forever.
-        for old in &victim_refs {
-            inner.deleted.remove_range(old.min_doc_id..=old.max_doc_id);
+        //
+        // Pruned by each victim's own *presence* bitmap, not its declared
+        // `[min_doc_id, max_doc_id]` range: a `SegmentRef`'s range can be
+        // wider than what it actually holds. `flush_locked` narrows a
+        // fresh segment's range to its true live span, but a memtable can
+        // have live documents both *before and after* a hole an off-lock
+        // merge reserved on it (`snapshot_merge_locked`) — a single
+        // contiguous range fundamentally cannot describe "content flanking
+        // someone else's reservation", so the two segments' declared
+        // ranges can still overlap even though neither one's *presence*
+        // ever does (doc ids are global and never reused, so a presence
+        // bit is only ever set in the one segment that legitimately owns
+        // it). Pruning by range here would delete a tombstone that
+        // actually belongs to a completely different, unrelated segment
+        // sharing numeric territory with a victim — silently resurrecting
+        // whatever document that tombstone was protecting.
+        for reader in &snapshot.victim_readers {
+            inner.deleted -= reader.presence();
         }
+        inner.deleted |= &new_tombstones;
         new_state.deleted = inner.deleted.iter().collect();
 
-        // Remove the victims, highest index first so an earlier removal
-        // never shifts the index of one still to come.
-        for &i in victims.iter().rev() {
+        // Re-locate every victim by id, not by the index captured at
+        // snapshot time: a concurrent flush only ever appends, so today
+        // those indices would in fact still be valid, but nothing here
+        // should depend on that staying true. A victim that's vanished
+        // (impossible today — `merge_gate` guarantees only this merge ever
+        // removes a segment, and nothing else does) is a bug elsewhere, not
+        // a condition to paper over.
+        let mut victim_indices: Vec<usize> = snapshot
+            .victim_refs
+            .iter()
+            .map(|v| {
+                new_state.segments.iter().position(|s| s.id == v.id).ok_or_else(|| {
+                    Error::internal(format!(
+                        "merge: victim segment {} vanished before this merge could commit — \
+                         merge_gate should make that unreachable",
+                        v.id
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
+        victim_indices.sort_unstable();
+        for &i in victim_indices.iter().rev() {
             new_state.segments.remove(i);
         }
 
-        // Every document merged away was dead — nothing to write, the
-        // victims simply disappear with no replacement.
-        let wrote_segment = claimed > 0;
         let mut new_reader = None;
-        if wrote_segment {
-            let segment_id = new_state.next_segment_id;
-            let paths = segment_file_paths(layout, &schema.name, segment_id);
-            let mut files = SegmentFiles::create(&paths)?;
-            let stats = merge_segments(
-                &merge_inputs,
-                schema,
-                merge_base,
-                &mut files.terms,
-                &mut files.ids,
-                &mut files.post,
-                &mut files.col,
-                &mut files.doc,
-            )?;
-            files.commit(&layout.segments_dir(&schema.name))?;
-            debug_assert_eq!(stats.doc_count as DocId, claimed);
-
-            new_state.next_segment_id += 1;
-            new_state.next_doc_id = merge_base + claimed;
-            // `victims[0]` is the smallest victim index, which — now that
-            // every victim has been removed — equals the number of
+        if let Some((paths, stats)) = &built {
+            // `max`, not a plain assignment: a concurrent flush may have
+            // already advanced this past what this merge alone would set it
+            // to, and this must never regress it — a smaller-than-reality
+            // `next_doc_id` would let a future flush's memtable hand out an
+            // id that segment or memtable already owns.
+            new_state.next_doc_id =
+                new_state.next_doc_id.max(snapshot.merge_base + snapshot.claimed);
+            // `victim_indices[0]` is the smallest victim index, which — now
+            // that every victim has been removed — equals the number of
             // untouched segments that came before it. Inserting there puts
             // the merged segment exactly where the earliest victim used to
             // sit, preserving relative recency against every segment not
             // involved in this merge.
             new_state.segments.insert(
-                victims[0],
+                victim_indices[0],
                 SegmentRef {
-                    id: segment_id,
+                    id: snapshot.segment_id,
                     doc_count: stats.doc_count as u32,
-                    min_doc_id: merge_base,
-                    max_doc_id: merge_base + claimed - 1,
+                    min_doc_id: snapshot.merge_base,
+                    max_doc_id: snapshot.merge_base + snapshot.claimed - 1,
                 },
             );
-            new_reader = Some(Arc::new(SegmentReader::open(&paths, schema)?));
+            new_reader = Some(Arc::new(SegmentReader::open(paths, schema)?));
         }
 
         // The commit point: a crash before this leaves the previous state
@@ -753,33 +997,28 @@ impl Collection {
         meta::write_state(layout, &schema.name, &new_state)?;
 
         inner.state = new_state;
-        // The active memtable's own `next_doc_id()` was `merge_base` before
-        // this merge started (see where `merge_base` is computed above) —
-        // without this, its next real insert would hand out `merge_base`
-        // again, colliding with the very first doc id this merge just
-        // wrote into a segment.
-        inner.memtable.reserve(claimed as usize);
-        for &i in victims.iter().rev() {
+        for &i in victim_indices.iter().rev() {
             inner.segments.remove(i);
         }
         if let Some(reader) = new_reader {
-            inner.segments.insert(victims[0], reader);
+            inner.segments.insert(victim_indices[0], reader);
         }
 
         // Cleanup, strictly after the commit. Safe with no concurrent-access
         // hazard: a search only ever borrows a source for the duration of
         // one read-lock hold — the borrow checker ties `&dyn IndexSource` to
-        // that guard's lifetime — and this runs under the exclusive write
-        // lock, so no in-flight reader can be holding a victim when this
-        // executes; `victim_readers` here is this function's own clone, kept
-        // alive until it drops at the end regardless.
-        for old in &victim_refs {
+        // that guard's lifetime — and every victim removed here has already
+        // been swapped out of `inner.segments` above, under the exclusive
+        // write lock this function holds throughout; `snapshot.victim_readers`
+        // is this call's own `Arc` clones, kept alive until they drop at the
+        // end of this function regardless.
+        for old in &snapshot.victim_refs {
             for ext in ["terms", "ids", "post", "col", "doc"] {
                 let _ = std::fs::remove_file(layout.segment_file(&schema.name, old.id, ext));
             }
         }
 
-        Ok(true)
+        Ok(())
     }
 
     /// Every source a search or suggest request reads through: the memtable,
@@ -1567,6 +1806,409 @@ mod tests {
         for i in 0..n {
             let doc = c.get(&(i + 1).to_string()).unwrap();
             assert_eq!(doc["price"], json!(100 + i));
+        }
+    }
+
+    // --- off-lock merge races -------------------------------------------
+    //
+    // A merge's build phase (`Collection::build_merge`) runs with no lock
+    // held — the whole point of the off-lock rewrite — so anything that
+    // used to be impossible mid-merge (a write landing while a merge is "in
+    // progress") is now routine. These tests drive `snapshot_merge_locked`,
+    // `build_merge`, and `swap_merge_locked` directly rather than through
+    // `run_merge`, so each one can land an exact, deterministic write in
+    // the gap between snapshot and swap instead of hoping a real thread
+    // wins a race — the same three functions `run_merge` itself calls, in
+    // the same order, just with a controlled interruption between stages
+    // instead of nothing.
+    //
+    // Each test locks `merge_gate` itself first, exactly as `run_merge`'s
+    // real callers do: without it, the `c.flush()`/`c.upsert()`/`c.delete()`
+    // calls used to simulate "a write during the build phase" would trigger
+    // their own *actual* automatic merge via `maybe_merge()` (nothing else
+    // is holding the gate to stop them), which would confuse the very
+    // scenario each test is trying to isolate.
+
+    #[test]
+    fn a_delete_during_the_merge_build_phase_is_not_resurrected() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap(); // segment 1: [1,2]
+        c.upsert(product("3", "c", 3)).unwrap();
+        c.upsert(product("4", "d", 4)).unwrap(); // segment 2: [3,4]
+        assert_eq!(c.stats().num_segments, 2);
+
+        let _gate = c.merge_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_merge_locked(&mut inner, &config).unwrap()
+        };
+        assert_eq!(snapshot.claimed, 4, "both victims were fully live at snapshot time");
+
+        // A write lands "during the build phase": "2" was live when the
+        // snapshot above was taken and is already baked into the merge
+        // output build_merge is about to produce.
+        assert!(c.delete("2").unwrap());
+
+        let built = Collection::build_merge(&snapshot, c.schema(), &layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::swap_merge_locked(&mut inner, c.schema(), &layout, snapshot, built)
+                .unwrap();
+        }
+        drop(_gate);
+
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.stats().num_documents, 3, "\"2\" must not have been resurrected by the merge");
+        assert!(matches!(c.get("2"), Err(Error::DocumentNotFound { .. })));
+        for id in ["1", "3", "4"] {
+            assert!(c.get(id).is_ok(), "doc {id} should have survived the merge");
+        }
+
+        // The restart path re-derives everything from `state.json` alone —
+        // if the tombstone remap were wrong, this is where it would show.
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, 3);
+        assert!(matches!(reopened.get("2"), Err(Error::DocumentNotFound { .. })));
+    }
+
+    #[test]
+    fn a_delete_during_a_second_merges_build_phase_targeting_an_already_merged_doc_is_not_resurrected(
+    ) {
+        // Same shape as the test above, but the deleted document has
+        // already been through one merge before this second one's build
+        // phase starts — its "old id" going into this merge's snapshot is
+        // itself a merge output's id, not an original flush's.
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap(); // segment 1: [1,2]
+        c.upsert(product("3", "c", 3)).unwrap();
+        c.upsert(product("4", "d", 4)).unwrap(); // segment 2: [3,4]
+        assert!(c.merge().unwrap(), "first merge: segments 1+2 fold into one");
+        assert_eq!(c.stats().num_segments, 1);
+
+        c.upsert(product("5", "e", 5)).unwrap();
+        c.upsert(product("6", "f", 6)).unwrap(); // segment 3
+        assert_eq!(c.stats().num_segments, 2, "the merged segment plus the new one");
+
+        let _gate = c.merge_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_merge_locked(&mut inner, &config).unwrap()
+        };
+        assert_eq!(snapshot.claimed, 6);
+
+        // "2" now lives in the *first* merge's output segment — one of
+        // this second merge's two victims.
+        assert!(c.delete("2").unwrap());
+
+        let built = Collection::build_merge(&snapshot, c.schema(), &layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::swap_merge_locked(&mut inner, c.schema(), &layout, snapshot, built)
+                .unwrap();
+        }
+        drop(_gate);
+
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.stats().num_documents, 5, "\"2\" must not have been resurrected");
+        assert!(matches!(c.get("2"), Err(Error::DocumentNotFound { .. })));
+        for id in ["1", "3", "4", "5", "6"] {
+            assert!(c.get(id).is_ok(), "doc {id} should have survived both merges");
+        }
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, 5);
+        assert!(matches!(reopened.get("2"), Err(Error::DocumentNotFound { .. })));
+    }
+
+    #[test]
+    fn an_upsert_during_the_merge_build_phase_supersedes_the_old_copy_without_duplication() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        c.upsert(product("1", "Old", 100)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap(); // segment 1: [1,2]
+        c.upsert(product("3", "c", 3)).unwrap();
+        c.upsert(product("4", "d", 4)).unwrap(); // segment 2: [3,4]
+        assert_eq!(c.stats().num_segments, 2);
+
+        let _gate = c.merge_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_merge_locked(&mut inner, &config).unwrap()
+        };
+
+        // "1"'s old copy lives in a victim about to be merged away. This
+        // upsert's new doc id must land past the snapshot's reservation in
+        // the active memtable, not collide with the merge's claimed range.
+        c.upsert(product("1", "New", 200)).unwrap();
+
+        let built = Collection::build_merge(&snapshot, c.schema(), &layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::swap_merge_locked(&mut inner, c.schema(), &layout, snapshot, built)
+                .unwrap();
+        }
+        drop(_gate);
+
+        assert_eq!(c.get("1").unwrap()["title"], json!("New"));
+        assert_eq!(
+            c.stats().num_documents,
+            4,
+            "the merged-away old copy of \"1\" must not be visible alongside the new one"
+        );
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.get("1").unwrap()["title"], json!("New"));
+        assert_eq!(reopened.stats().num_documents, 4);
+    }
+
+    #[test]
+    fn a_flush_during_the_merge_build_phase_is_not_lost_and_does_not_collide_with_it() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap(); // segment 1
+        c.upsert(product("3", "c", 3)).unwrap();
+        c.upsert(product("4", "d", 4)).unwrap(); // segment 2
+        assert_eq!(c.stats().num_segments, 2);
+
+        let _gate = c.merge_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_merge_locked(&mut inner, &config).unwrap()
+        };
+
+        // A brand new segment commits while the merge's build phase would
+        // be running — an explicit flush, so this test controls exactly
+        // when it happens rather than relying on the doc-count threshold.
+        c.upsert(product("5", "e", 5)).unwrap();
+        assert!(c.flush().unwrap());
+        assert_eq!(
+            c.stats().num_segments,
+            3,
+            "the two not-yet-swapped victims plus the concurrently flushed one"
+        );
+
+        let built = Collection::build_merge(&snapshot, c.schema(), &layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::swap_merge_locked(&mut inner, c.schema(), &layout, snapshot, built)
+                .unwrap();
+        }
+        drop(_gate);
+
+        // Two victims replaced by one merged segment, plus the
+        // concurrently flushed one that must have survived the swap.
+        assert_eq!(c.stats().num_segments, 2);
+        assert_eq!(c.stats().num_documents, 5);
+        for id in ["1", "2", "3", "4", "5"] {
+            assert!(c.get(id).is_ok(), "doc {id} must survive");
+        }
+
+        // No id collision between the merge's output range and the
+        // concurrently flushed segment's range.
+        let inner = c.inner.read();
+        let mut ranges: Vec<(DocId, DocId)> =
+            inner.state.segments.iter().map(|s| (s.min_doc_id, s.max_doc_id)).collect();
+        ranges.sort_unstable();
+        for w in ranges.windows(2) {
+            assert!(w[0].1 < w[1].0, "overlapping segment ranges {:?} and {:?}", w[0], w[1]);
+        }
+        drop(inner);
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, 5);
+        for id in ["1", "2", "3", "4", "5"] {
+            assert!(reopened.get(id).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_long_run_of_interleaved_writes_and_merges_never_resurrects_a_deleted_document() {
+        // Fully single-threaded and deterministic, but exercises the same
+        // pattern the real bug this regression-tests came from: many small,
+        // frequent merges (`merge_trigger_segments`/`merge_fan_in` = 2, so
+        // almost every flush becomes eligible) interleaved with deletes,
+        // over enough iterations that a merge's own reservation
+        // (`snapshot_merge_locked`, via `MemTable::reserve`) lands in the
+        // *middle* of an actively-written memtable — something the pre-
+        // off-lock design could never produce, since its merge always ran
+        // immediately after its own triggering flush, on a guaranteed-fresh
+        // memtable. That gave a later flush of that same memtable a
+        // *wider* declared range than what it actually held live (real
+        // documents both before and after the reservation's hole), which
+        // in turn made the merge that eventually retired an *unrelated*
+        // segment sharing that numeric territory prune a tombstone that
+        // didn't belong to it — silently resurrecting a deleted document.
+        // Fixed by pruning a retired segment's tombstones through its own
+        // presence bitmap (exact, never overlapping) rather than its
+        // declared range (can overlap another segment's, since a single
+        // contiguous range can't describe "content flanking someone
+        // else's reservation").
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.initialize().unwrap();
+        let config = EngineConfig::new(dir.path())
+            .with_max_memtable_docs(3)
+            .with_merge_trigger_segments(2)
+            .with_merge_fan_in(2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        const N: usize = 150;
+        let mut expected_alive: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for i in 0..N {
+            let id = i.to_string();
+            c.upsert(product(&id, "widget", i as i64)).unwrap();
+            expected_alive.insert(id);
+            if i % 5 == 0 {
+                let victim = i.saturating_sub(3).to_string();
+                if c.delete(&victim).unwrap() {
+                    expected_alive.remove(&victim);
+                }
+            }
+            if i % 11 == 0 {
+                c.merge().unwrap();
+            }
+        }
+
+        let mut mismatches = Vec::new();
+        for i in 0..N {
+            let id = i.to_string();
+            let alive = c.get(&id).is_ok();
+            let should_be_alive = expected_alive.contains(&id);
+            if alive != should_be_alive {
+                mismatches.push((id, alive, should_be_alive));
+            }
+        }
+        assert!(mismatches.is_empty(), "(id, actually_alive, should_be_alive): {mismatches:?}");
+        assert_eq!(c.stats().num_documents, expected_alive.len() as u64);
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, expected_alive.len() as u64);
+        for id in &expected_alive {
+            assert!(reopened.get(id).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_merge_gate_held_elsewhere_makes_maybe_merge_a_harmless_no_op() {
+        // `maybe_merge` (the automatic post-write trigger) must never block
+        // on `merge_gate` — it uses `try_lock` and simply skips. Verified
+        // directly: hold the gate, perform writes that would ordinarily
+        // trigger a merge, and confirm segment count is left untouched by
+        // anything other than the flushes those writes themselves caused.
+        let (_dir, layout, config) = merge_harness(1, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        let _gate = c.merge_gate.lock();
+        for i in 0..6 {
+            c.upsert(product(&(i + 1).to_string(), "x", i)).unwrap();
+        }
+        // trigger=1, max_memtable_docs=2: 3 flushes, and with the gate held
+        // throughout, not one of `maybe_merge`'s attempts could have run.
+        assert_eq!(c.stats().num_segments, 3, "merging must have been skipped, not blocked on");
+        drop(_gate);
+
+        // Once released, the very next write's own `maybe_merge` call
+        // catches up.
+        c.upsert(product("7", "x", 7)).unwrap();
+        assert!(c.stats().num_segments < 3, "merging should resume once the gate is free");
+        assert_eq!(c.stats().num_documents, 7);
+    }
+
+    #[test]
+    fn concurrent_writes_and_merges_leave_the_collection_internally_consistent() {
+        // Real threads this time, not the controlled single-threaded
+        // interleavings above — a broad smoke test that nothing panics,
+        // deadlocks, or corrupts state under genuine concurrent load, with
+        // an independently computed expectation to check the result
+        // against rather than just "it didn't crash". Each thread owns a
+        // disjoint id namespace (`"{thread}-{i}"`) so the expected outcome
+        // for a given id never depends on inter-thread ordering — only on
+        // that one thread's own sequence, which every thread runs
+        // identically regardless of how the others interleave with it.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.initialize().unwrap();
+        let config = EngineConfig::new(dir.path())
+            .with_max_memtable_docs(3)
+            .with_merge_trigger_segments(2)
+            .with_merge_fan_in(2);
+        let c = Arc::new(Collection::create(&layout, schema(), &config).unwrap());
+
+        const THREADS: usize = 4;
+        // Small enough that the expected-alive count stays under
+        // `tachyon_query::request::MAX_LIMIT` (250) — the search assertion
+        // below needs a window big enough to hold every match, and the
+        // API refuses a `limit` past that cap.
+        const PER_THREAD: usize = 50;
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let c = Arc::clone(&c);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let id = format!("{t}-{i}");
+                    c.upsert(product(&id, "widget", (t * 1000 + i) as i64)).unwrap();
+                    if i % 5 == 0 {
+                        let victim = format!("{t}-{}", i.saturating_sub(3));
+                        c.delete(&victim).unwrap();
+                    }
+                    if i % 11 == 0 {
+                        c.merge().unwrap();
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread panicked");
+        }
+
+        // The same delete pattern each thread ran, replayed here against a
+        // plain `HashSet` instead of the collection — an independent
+        // reference for what should still be alive.
+        let mut expected_alive: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                expected_alive.insert(format!("{t}-{i}"));
+            }
+            for i in (0..PER_THREAD).step_by(5) {
+                expected_alive.remove(&format!("{t}-{}", i.saturating_sub(3)));
+            }
+        }
+
+        for id in &expected_alive {
+            assert!(c.get(id).is_ok(), "expected {id} to be alive");
+        }
+        assert_eq!(c.stats().num_documents, expected_alive.len() as u64);
+
+        // Global consistency, not just per-id: a window big enough to hold
+        // every match must find exactly the expected count, exactly.
+        let found = c
+            .search(SearchParams {
+                q: Some("widget".into()),
+                match_mode: Some("any".into()),
+                limit: Some(expected_alive.len() + 10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(found.found_is_exact, "a full window must never skip a block");
+        assert_eq!(found.found, expected_alive.len());
+
+        drop(c);
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, expected_alive.len() as u64);
+        for id in &expected_alive {
+            assert!(reopened.get(id).is_ok());
         }
     }
 }

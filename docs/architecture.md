@@ -254,10 +254,12 @@ lock only for the WAL append and the memtable update, except when it also
 triggers a flush — that runs to completion under the same acquisition (see
 "Segments"), so the occasional write that crosses the memtable threshold
 blocks readers for the length of a segment encode and write rather than a WAL
-append. This is deliberately simple, and it is the obvious place to look when
-write throughput under concurrent search becomes the bottleneck — the next
-step would be an atomically-swapped read snapshot so searches never block at
-all.
+append. A flush that goes on to trigger a merge does *not* extend that
+hold any further — see "Merges" below for why, and for what still does.
+This is deliberately simple, and a large flush's own lock hold is the
+obvious place to look next if write throughput under concurrent search
+becomes the bottleneck — an atomically-swapped read snapshot, or streaming
+the flush itself the way a merge now streams, would be the next step.
 
 ## Merges
 
@@ -266,11 +268,8 @@ each segment pays its own decode independently — so segment count, not
 corpus size alone, drives query latency up over a collection's life. A merge
 folds several small segments into one, keeping that count from growing
 without bound: once a collection holds more than `merge_trigger_segments`
-segments (default 8), the flush that crossed that line also picks the
-`merge_fan_in` smallest by document count (default 4, size-tiered in
-spirit) and merges them, right after its own commit and under the same
-write-lock hold. At most one merge per flush, so segment count converges
-down over several flushes rather than in one large pause.
+segments (default 8), the smallest `merge_fan_in` by document count
+(default 4, size-tiered in spirit) are folded into one.
 
 **A merge renumbers documents, it does not preserve their ids.** A segment's
 doc-id range is fixed for its life (see "Segments" above), so folding two
@@ -289,20 +288,88 @@ decode at all; a `Str`/`Array` slot's blob bytes and a document's stored
 source JSON are copied verbatim, with only offsets rebased to the new
 file's positions. Only postings are actually decoded, and only because
 block boundaries genuinely shift once dead documents drop out and ids
-change. Retired ids are simply never claimed again, and any tombstones for
-them are pruned from `state.json`'s `deleted` list as part of the merge's
-own commit, the same way a flush's own commit is the point of no return.
+change.
 
 Memory stays bounded by what one term-field's postings, one field's column,
 or one document's blob bytes need — never by corpus size or by
 `merge_fan_in × segment size`. Measured directly on a 1M-document
 collection (four 250k-document segments, `merge_fan_in=4`): each merge's own
-RSS delta averaged **~93 MiB**, peaking at **~110 MiB**, and a run's overall
-indexing peak RSS (four flushes plus the merges they triggered) fell from
-999 MiB to **646 MiB** compared to the pre-streaming merge — a genuine,
-sustained reduction, not just a shorter spike. `--merge-fan-in` still trades
-frequency against average merge cost the same way it always did; it no
-longer trades against a memory ceiling that scaled with the merge itself.
+RSS delta averaged **~93 MiB**, peaking at **~110 MiB** — a genuine,
+sustained reduction from the pre-streaming design (which held every victim's
+worth of live documents decoded in memory at once), not just a shorter spike.
+`--merge-fan-in` still trades frequency against average merge cost the same
+way it always did; it no longer trades against a memory ceiling that scaled
+with the merge itself.
+
+### Running off the write lock
+
+`Collection::run_merge` (`crates/tachyon-engine/src/collection.rs`) splits a
+merge into three stages, and only the first and third hold `inner`'s write
+lock:
+
+1. **Snapshot** (locked). Pick victims, clone their `Arc<SegmentReader>`s,
+   and compute each one's `live` bitmap (its presence minus the collection's
+   current tombstones). Reserve everything a concurrent write could
+   otherwise race with, right here: the output doc id range, via
+   `MemTable::reserve` on the active memtable, and the output segment id,
+   by bumping `state.next_segment_id`. Both reservations are simple
+   monotonic-counter bumps, so a concurrent flush or another merge attempt
+   can never claim the same range or id — see the two doc comments in
+   `snapshot_merge_locked` for exactly how each one stays safe across any
+   number of intervening flushes.
+2. **Build** (unlocked). `tachyon_index::merge_segments` streams the merge
+   into five new segment files, using only what the snapshot captured.
+   This is the expensive part — the whole reason for the three-way split —
+   and it runs with searches and writes proceeding normally.
+3. **Swap** (locked). Commit: re-validate against whatever changed while
+   the build ran without the lock, then write `state.json` and publish the
+   new segment.
+
+**What "whatever changed" means in practice**, and why the swap stage has
+to re-derive rather than trust the snapshot:
+
+- A **flush** may have committed a new segment, or advanced
+  `state.next_doc_id`, while the build ran. The swap stage clones `inner
+  .state` *fresh*, not the clone the snapshot would have taken, so none of
+  that is silently discarded, and it takes `next_doc_id` as
+  `max(current, merge_base + claimed)` rather than assigning it outright —
+  a plain assignment could regress a value a concurrent flush had already
+  advanced further.
+- A **delete, or an upsert superseding an old copy**, may have landed on a
+  document the snapshot already considered live and copied into the merge
+  output. That document's old tombstone needs to reappear under its *new*
+  id: the swap stage intersects each victim's snapshotted `live` bitmap
+  against the tombstones that have landed since, then reproduces
+  `merge_segments`'s own rank-based remap for each one that matches.
+- A victim segment's own tombstones, once it's retired, are pruned from
+  the collection-wide tombstone set by that segment's **presence bitmap**,
+  not by its declared `[min_doc_id, max_doc_id]` range. The two used to be
+  interchangeable, but off-lock merging broke that: a memtable can now
+  have live documents both *before and after* a hole a merge reserved on
+  it (`MemTable::reserve`, mid-write rather than always on a guaranteed-
+  fresh memtable the way the single-lock design's timing happened to
+  guarantee), so the segment that memtable eventually flushes into can
+  have a declared range wider than what it actually holds — wide enough to
+  numerically overlap an unrelated segment's range. Pruning by that range
+  would delete a tombstone that belongs to the *other* segment, silently
+  resurrecting whatever document it was protecting. Pruning by presence
+  is exact regardless, since a doc id is never reused and so is only ever
+  set in the one segment that actually owns it.
+
+At most one merge runs at a time, enforced by `merge_gate`, a plain
+`Mutex<()>` outside `inner`'s own lock — an explicit `Collection::merge()`
+call blocks on it (a caller reaching for that method wants a merge to have
+happened by the time it returns); the automatic post-write check,
+`maybe_merge`, uses `try_lock` and simply skips if one is already running,
+trusting the next write to check again.
+
+Measured on a 1M-document run (default `merge_trigger_segments`/
+`merge_fan_in`, background searches running the whole time): worst-case
+concurrent search latency during indexing fell from 3.7 s (before any of
+this project) to **233 ms** — an 8× reduction — with what's left dominated
+by a large flush's own lock hold (see "Concurrency" above), not by
+merging, which no longer holds the lock for anything but a snapshot and a
+commit.
 
 ## Score-bound pruning
 
@@ -368,15 +435,20 @@ bound check ever runs.
 
 ## What is not built yet
 
-**Off-lock merging.** A merge still runs synchronously under the same
-write-lock hold as the flush that triggered it, so every search stalls for
-its duration — shrunk a great deal by the streaming rewrite above (no more
-re-parsing or re-tokenizing every merged document, no more materializing
-the whole merge in memory before writing it), but not eliminated. Segments
-are immutable and a merge only ever reads its victims, so in principle the
-bulk of a merge's work could run entirely outside the lock, taking it only
-for the final state swap — the real complication is a delete landing on a
-victim while its merge is still in flight, which has to be re-checked
-against the collection's tombstones and remapped into the new id space at
-swap time rather than silently resurrected. Deferred until the streaming
-merge's own remaining stall is shown to matter in practice.
+**Off-lock flushing.** Merging no longer holds the write lock for its own
+duration (see "Running off the write lock" under "Merges" above), but a
+flush still does: encoding a memtable into a segment and writing it runs
+synchronously under the same write-lock hold as the insert or delete that
+crossed the threshold, so every search stalls for a large flush's full
+duration. `encode_streaming` already streams in bounded memory the same
+way a merge's build phase does, so the memory side of this is already
+solved — what a flush would need to become off-lock is the same shape a
+merge now has: reserve the output segment id and doc range up front,
+encode without the lock held, then re-validate and commit. The
+complication is different from a merge's, though — a flush's own memtable
+is exactly what concurrent writes want to keep inserting into, so an
+off-lock flush would need to swap in a fresh memtable for new writes to
+land in *before* the encode starts, rather than after. Deferred until the
+remaining stall (measured at 233 ms worst-case on a 1M-document
+flush-under-load run, down from 3.7 s before any of this work) is shown to
+matter in practice.
