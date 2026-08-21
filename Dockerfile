@@ -89,7 +89,7 @@ RUN cargo build --release --locked --bin tachyon \
 # Runtime
 # ============================================================
 
-FROM alpine:3.21
+FROM alpine:3.24
 
 # ca-certificates: HTTPS/TLS support
 # tini: proper PID 1 / signal forwarding / zombie reaping
