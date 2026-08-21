@@ -76,6 +76,15 @@ fn segment_tmp_path(path: &Path) -> PathBuf {
 /// or a large document's worth of writes before it needs to flush.
 const SEGMENT_WRITE_BUF_SIZE: usize = 256 * 1024;
 
+/// How far past its ordinary flush thresholds the active memtable is allowed
+/// to grow while a flush's build phase is already in progress before a
+/// write blocks on `flush_gate` instead of returning immediately. Without
+/// this, ingest that outruns the build phase would let the memtable grow
+/// without bound — `maybe_flush`'s ordinary `try_lock`-and-skip is meant to
+/// avoid serializing writers behind a flush that's already running, not to
+/// let one run forever behind an ever-growing memtable.
+const FLUSH_BACKPRESSURE_MULTIPLE: usize = 2;
+
 /// The five open files one segment's bytes stream into — the same durability
 /// shape `write_atomic` gives a single file (write to a temp sibling, fsync,
 /// rename, fsync the directory), just committed as one group of five rather
@@ -177,6 +186,43 @@ struct MergeSnapshot {
     live: Vec<RoaringBitmap>,
 }
 
+/// Everything an off-lock flush's build phase (`Collection::build_flush`)
+/// needs, captured under the write lock (`Collection::snapshot_flush_locked`)
+/// so nothing about which documents are being flushed, or which segment id
+/// they'll land at, can change while that phase runs without holding it.
+///
+/// Unlike a merge's snapshot, this one's `memtable` is exactly what the
+/// output segment will contain — a flush preserves doc ids rather than
+/// renumbering them, so nothing here needs the rank-based tombstone remap
+/// `MergeSnapshot`/`swap_merge_locked` carry for merges; a delete or
+/// supersede landing on a sealed id during the build is just a tombstone
+/// under that same id (see `apply_delete`/`apply_upsert`'s `frozen` branch).
+struct FlushSnapshot {
+    segment_id: u64,
+    /// The sealed memtable. Also installed at `inner.frozen` for the
+    /// duration of the build, so searches, lookups, and deletes keep seeing
+    /// it exactly like a committed segment.
+    memtable: Arc<MemTable>,
+    /// `next_seq - 1` as of the seal — the WAL checkpoint this flush will
+    /// commit. Captured here, not recomputed at commit time: by commit time
+    /// a concurrent write's record may already live in the *new* WAL
+    /// generation, and recomputing from `inner.next_seq` then would
+    /// silently claim credit for a record this flush never captured.
+    applied_seq: u64,
+    /// The generation new writes land in while this flush is in flight —
+    /// becomes `state.wal_generation` at commit, and every generation below
+    /// it is deleted then (its records are, by construction, all durably
+    /// captured either in this segment or an earlier one).
+    new_wal_generation: u64,
+    doc_count: u32,
+    min_doc_id: DocId,
+    max_doc_id: DocId,
+    /// `memtable.next_doc_id()` as of the seal, folded into the committed
+    /// state via `max` at commit — see `commit_flush_locked` for why a
+    /// plain assignment would be wrong.
+    next_doc_id: DocId,
+}
+
 /// Per-document result of a batch write. A batch is not all-or-nothing: PRD
 /// §7.2 requires atomicity *per document*, so one malformed document does not
 /// reject its neighbours.
@@ -229,12 +275,22 @@ struct Inner {
     state: CollectionState,
     wal: Wal,
     memtable: MemTable,
+    /// Sealed by an in-flight off-lock flush's snapshot stage
+    /// (`Collection::snapshot_flush_locked`), immutable from that moment
+    /// until the flush commits (`Collection::commit_flush_locked`, which
+    /// clears this) or its build fails and the sealed memtable is handed
+    /// back for retry. At most one can ever exist at once — `flush_gate`
+    /// guarantees it. Consulted between the active memtable and committed
+    /// segments everywhere a lookup, read, or delete walks `Inner`'s
+    /// sources, exactly like one more (not-yet-durable) segment.
+    frozen: Option<Arc<MemTable>>,
     /// Committed segments, oldest first. Consulted newest-first (`.rev()`)
     /// after a memtable miss, since a later segment's version of an id, if
     /// any, is the current one.
     segments: Vec<Arc<SegmentReader>>,
-    /// Tombstones for doc ids that live in committed segments. Memtable
-    /// documents are deleted in place, so they never appear here.
+    /// Tombstones for doc ids that live in a frozen memtable or a committed
+    /// segment. The active memtable's own documents are deleted in place,
+    /// so they never appear here.
     deleted: RoaringBitmap,
     /// Next WAL sequence number to hand out.
     next_seq: u64,
@@ -262,6 +318,20 @@ pub struct Collection {
     /// automatic post-write check) uses `try_lock` and simply skips if a
     /// merge is already running — the next write will check again.
     merge_gate: Mutex<()>,
+    /// Held for the duration of a flush's build phase, the same role
+    /// `merge_gate` plays for a merge — see that field's doc comment for
+    /// why the write lock is deliberately not held there instead. Because a
+    /// flush's snapshot stage populates `inner.frozen`, this also caps the
+    /// WAL generation chain `Collection::open` must be able to replay at
+    /// two: at most one flush is ever sealed-but-uncommitted at a time.
+    ///
+    /// Doubles as where a failed build's retry state lives: if
+    /// `Collection::build_flush` errors, the sealed `FlushSnapshot` is
+    /// handed back into this `Option` instead of being discarded (the
+    /// memtable it points to stays live at `inner.frozen` throughout), and
+    /// the next call to acquire this gate resumes from it — rebuilding the
+    /// same segment — rather than sealing a second one.
+    flush_gate: Mutex<Option<FlushSnapshot>>,
 }
 
 impl Collection {
@@ -279,7 +349,7 @@ impl Collection {
     /// Open an existing collection, replaying any WAL tail.
     pub fn open(layout: &Layout, name: &str, config: &EngineConfig) -> Result<Collection> {
         let schema = meta::read_schema(layout, name)?;
-        let state = meta::read_state(layout, name)?;
+        let mut state = meta::read_state(layout, name)?;
 
         let mut deleted = RoaringBitmap::new();
         for id in &state.deleted {
@@ -297,54 +367,126 @@ impl Collection {
         let mut memtable = MemTable::new(state.next_doc_id, &schema);
         let mut next_seq = state.next_seq;
 
-        let wal_path = layout.wal_file(name, state.wal_generation);
-        let scan = wal::read(&wal_path)?;
-        let mut replayed = 0usize;
-
-        for record in scan.records {
-            if record.seq() <= state.applied_seq {
-                // Already durable in a segment.
-                continue;
+        // Normally exactly one generation exists: `state.wal_generation`
+        // itself. A crash between an off-lock flush sealing a generation and
+        // committing its segment leaves that one plus the fresh one it
+        // rolled to — both still needed to reconstruct the memtable the
+        // never-committed segment would have held. `state.wal_generation`
+        // (see its doc comment) is defined as the *oldest* generation not
+        // yet captured, which is exactly the lower bound replay needs; any
+        // generation below it on disk is a leftover from a flush that *did*
+        // commit but crashed before its own cleanup, already durably
+        // superseded and safe to delete outright.
+        let all_gens = layout.list_wal_generations(name)?;
+        for &gen in &all_gens {
+            if gen < state.wal_generation {
+                let _ = std::fs::remove_file(layout.wal_file(name, gen));
             }
-            next_seq = next_seq.max(record.seq() + 1);
-            replayed += 1;
+        }
+        let mut generations: Vec<u64> =
+            all_gens.into_iter().filter(|g| *g >= state.wal_generation).collect();
+        if generations.is_empty() {
+            // A collection that has never flushed has no generation file on
+            // disk yet at all; `Wal::open` below creates it.
+            generations.push(state.wal_generation);
+        }
+        generations.sort_unstable();
+        let highest_generation = *generations.last().expect("just ensured non-empty");
 
-            match record {
-                WalRecord::Upsert { doc, seq } => {
-                    // The document passed validation before it was logged, so
-                    // a failure here means the log and the schema disagree.
-                    let parsed = ParsedDocument::parse(doc, &schema).map_err(|e| {
-                        Error::corruption(format!(
-                            "{}: record seq {seq} does not match the collection schema: {e}",
-                            wal_path.display()
-                        ))
-                    })?;
-                    Self::apply_upsert(&mut memtable, &mut deleted, &segments, parsed);
+        let mut replayed = 0usize;
+        let mut any_truncated = false;
+        for &gen in &generations {
+            let wal_path = layout.wal_file(name, gen);
+            let scan = wal::read(&wal_path)?;
+            if scan.truncated_at.is_some() && gen != highest_generation {
+                // Every generation below the highest was fsynced in full
+                // before a newer one was ever rolled (the seal-time
+                // `wal.sync()` in `snapshot_flush_locked`) — a torn tail
+                // there means on-disk corruption, not a mid-write crash, and
+                // silently truncating it could discard an acknowledged
+                // write that a later generation's records still depend on.
+                return Err(Error::corruption(format!(
+                    "{}: torn tail in a non-final WAL generation",
+                    wal_path.display()
+                )));
+            }
+            any_truncated |= scan.truncated_at.is_some();
+
+            for record in scan.records {
+                if record.seq() <= state.applied_seq {
+                    // Already durable in a segment.
+                    continue;
                 }
-                WalRecord::Delete { id, .. } => {
-                    Self::apply_delete(&mut memtable, &mut deleted, &segments, &id);
+                next_seq = next_seq.max(record.seq() + 1);
+                replayed += 1;
+
+                match record {
+                    WalRecord::Upsert { doc, seq } => {
+                        // The document passed validation before it was logged, so
+                        // a failure here means the log and the schema disagree.
+                        let parsed = ParsedDocument::parse(doc, &schema).map_err(|e| {
+                            Error::corruption(format!(
+                                "{}: record seq {seq} does not match the collection schema: {e}",
+                                wal_path.display()
+                            ))
+                        })?;
+                        Self::apply_upsert(&mut memtable, None, &mut deleted, &segments, parsed);
+                    }
+                    WalRecord::Delete { id, .. } => {
+                        Self::apply_delete(&mut memtable, None, &mut deleted, &segments, &id);
+                    }
                 }
             }
         }
 
-        if replayed > 0 || scan.truncated_at.is_some() {
+        // A crash between a flush sealing a memtable and committing its
+        // segment leaves that memtable's documents replayed above at fresh
+        // ids (the WAL, not the never-committed segment, is authoritative) —
+        // orphaning any tombstone recorded against their *old* ids. Harmless
+        // for visibility (nothing owns those old ids any more, live or
+        // dead), but `stats()` subtracts `deleted.len()` from segment doc
+        // counts, and a stale entry here would silently undercount forever.
+        let mut owned_by_a_segment = RoaringBitmap::new();
+        for segment in &segments {
+            owned_by_a_segment |= segment.presence();
+        }
+        deleted &= owned_by_a_segment;
+
+        if replayed > 0 || any_truncated {
             tracing::info!(
                 collection = name,
                 replayed,
-                torn_tail = scan.truncated_at.is_some(),
+                torn_tail = any_truncated,
                 live_documents = memtable.len(),
                 "replayed write-ahead log"
             );
         }
 
-        let wal = Wal::open(&wal_path, config.sync_policy)?;
+        let wal = Wal::open(layout.wal_file(name, highest_generation), config.sync_policy)?;
+        // In memory only: this is the generation actually open for
+        // appending now, which is what `snapshot_flush_locked` must seal
+        // next. Persisting it is `commit_flush_locked`'s job, the same as
+        // it always was — if this process crashes again before a flush
+        // commits, the next open recomputes the same chain and replays it
+        // the same way, redoing this reconstruction from scratch rather
+        // than trusting a value nothing has made durable yet.
+        state.wal_generation = highest_generation;
 
         Ok(Collection {
             schema,
             layout: layout.clone(),
             config: config.clone(),
-            inner: RwLock::new(Inner { state, wal, memtable, segments, deleted, next_seq }),
+            inner: RwLock::new(Inner {
+                state,
+                wal,
+                memtable,
+                frozen: None,
+                segments,
+                deleted,
+                next_seq,
+            }),
             merge_gate: Mutex::new(()),
+            flush_gate: Mutex::new(None),
         })
     }
 
@@ -389,20 +531,15 @@ impl Collection {
                 inner.wal.append_batch(&records)?;
                 inner.next_seq = first_seq + accepted.len() as u64;
 
-                {
-                    let Inner { memtable, deleted, segments, .. } = &mut *inner;
-                    for (i, parsed) in accepted {
-                        let id = parsed.id.clone();
-                        Self::apply_upsert(memtable, deleted, segments, parsed);
-                        results[i] = Some(DocOutcome::ok(id));
-                    }
+                let Inner { memtable, frozen, deleted, segments, .. } = &mut *inner;
+                for (i, parsed) in accepted {
+                    let id = parsed.id.clone();
+                    Self::apply_upsert(memtable, frozen.as_deref(), deleted, segments, parsed);
+                    results[i] = Some(DocOutcome::ok(id));
                 }
+            } // write lock released before a flush or merge is even considered
 
-                if Self::needs_flush_locked(&inner, &self.config) {
-                    Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
-                }
-            } // write lock released before a merge is even considered
-
+            self.maybe_flush();
             self.maybe_merge();
         }
 
@@ -434,18 +571,11 @@ impl Collection {
             inner.wal.append(&WalRecordRef::Delete { seq, id })?;
             inner.next_seq = seq + 1;
 
-            let removed = {
-                let Inner { memtable, deleted, segments, .. } = &mut *inner;
-                Self::apply_delete(memtable, deleted, segments, id)
-            };
+            let Inner { memtable, frozen, deleted, segments, .. } = &mut *inner;
+            Self::apply_delete(memtable, frozen.as_deref(), deleted, segments, id)
+        }; // write lock released before a flush or merge is even considered
 
-            if Self::needs_flush_locked(&inner, &self.config) {
-                Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?;
-            }
-
-            removed
-        }; // write lock released before a merge is even considered
-
+        self.maybe_flush();
         self.maybe_merge();
         Ok(removed)
     }
@@ -521,15 +651,23 @@ impl Collection {
         // delete or upsert-supersedes-a-segment-doc between flushes — using
         // the stale snapshot here would overcount until the next flush
         // happens to catch up.
+        //
+        // `inner.deleted` only ever tombstones ids owned by a frozen
+        // memtable or a committed segment (the active memtable deletes in
+        // place instead), so summing those two doc counts before
+        // subtracting it — rather than subtracting from each separately —
+        // gives an exact answer without needing a range-restricted count.
         let segment_docs: u64 = inner.state.segments.iter().map(|s| s.doc_count as u64).sum();
-        let num_documents =
-            segment_docs.saturating_sub(inner.deleted.len()) + inner.memtable.len() as u64;
+        let frozen_docs = inner.frozen.as_ref().map_or(0, |f| f.len() as u64);
+        let frozen_bytes = inner.frozen.as_ref().map_or(0, |f| f.heap_bytes());
+        let num_documents = (segment_docs + frozen_docs).saturating_sub(inner.deleted.len())
+            + inner.memtable.len() as u64;
         CollectionStats {
             name: self.schema.name.clone(),
             num_documents,
             num_segments: inner.state.segments.len(),
-            memtable_documents: inner.memtable.len(),
-            memtable_bytes: inner.memtable.heap_bytes(),
+            memtable_documents: inner.memtable.len() + frozen_docs as usize,
+            memtable_bytes: inner.memtable.heap_bytes() + frozen_bytes,
             wal_bytes: inner.wal.size(),
             created_at: self.schema.created_at,
         }
@@ -546,11 +684,15 @@ impl Collection {
     /// Ordinarily triggered automatically once a write crosses
     /// [`EngineConfig::max_memtable_docs`] or `max_memtable_bytes`; exposed
     /// directly for tests and for an operator forcing an early flush.
+    ///
+    /// Blocks on `flush_gate` rather than skipping if one is already in
+    /// flight, for the same reason `merge()` blocks on `merge_gate`: a
+    /// caller reaching for this method explicitly wants a flush to have
+    /// happened by the time it returns.
     pub fn flush(&self) -> Result<bool> {
-        let flushed = {
-            let mut inner = self.inner.write();
-            Self::flush_locked(&mut inner, &self.schema, &self.layout, &self.config)?
-        }; // write lock released before a merge is even considered
+        let mut gate = self.flush_gate.lock();
+        let flushed = self.run_flush(&mut gate)?;
+        drop(gate); // released before a merge is even considered
         self.maybe_merge();
         Ok(flushed)
     }
@@ -579,49 +721,156 @@ impl Collection {
 
     // --- internals -------------------------------------------------------
 
+    /// A flush is due either because the active memtable has grown past its
+    /// thresholds, or because a previous flush attempt sealed a memtable and
+    /// then failed to build it — `inner.frozen` still holds that work, and
+    /// nothing else will retry it except another flush attempt.
     fn needs_flush_locked(inner: &Inner, config: &EngineConfig) -> bool {
-        inner.memtable.len() >= config.max_memtable_docs
+        inner.frozen.is_some()
+            || inner.memtable.len() >= config.max_memtable_docs
             || inner.memtable.heap_bytes() >= config.max_memtable_bytes
     }
 
-    /// Runs under the same write-lock acquisition as the mutation that
-    /// triggered it — encoding, committing, and retiring the old WAL
-    /// generation all happen before any other write can observe `inner`.
-    /// Splitting this into separate lock acquisitions would let a concurrent
-    /// write's WAL record land with a `seq` at or below the `applied_seq`
-    /// this flush is about to commit, silently excluding it from replay
-    /// forever.
-    fn flush_locked(
+    /// Best-effort: run a flush if one is due and none is already in flight.
+    /// Called after every write's own lock scope has ended, mirroring
+    /// `maybe_merge` — see its doc comment for why errors are logged rather
+    /// than propagated here.
+    ///
+    /// Unlike `maybe_merge`, this does not simply skip when the gate is
+    /// held if the active memtable is *severely* over threshold
+    /// (`FLUSH_BACKPRESSURE_MULTIPLE`×): ingest outrunning the build phase
+    /// would otherwise let the memtable grow without bound while a flush is
+    /// perpetually "in progress" elsewhere. In that case this blocks on the
+    /// gate instead, applying backpressure to the writer that triggered it.
+    fn maybe_flush(&self) {
+        let (needs_flush, over_hard_limit) = {
+            let inner = self.inner.read();
+            (
+                Self::needs_flush_locked(&inner, &self.config),
+                // `saturating_mul`: `max_memtable_docs`/`max_memtable_bytes`
+                // can be `usize::MAX` (an effectively unbounded threshold —
+                // `tachyon-bench`'s default), and a plain `*` would overflow.
+                inner.memtable.len()
+                    >= self.config.max_memtable_docs.saturating_mul(FLUSH_BACKPRESSURE_MULTIPLE)
+                    || inner.memtable.heap_bytes()
+                        >= self
+                            .config
+                            .max_memtable_bytes
+                            .saturating_mul(FLUSH_BACKPRESSURE_MULTIPLE),
+            )
+        };
+        if !needs_flush {
+            return;
+        }
+
+        let mut gate = if over_hard_limit {
+            self.flush_gate.lock()
+        } else {
+            match self.flush_gate.try_lock() {
+                Some(gate) => gate,
+                None => return,
+            }
+        };
+        if let Err(e) = self.run_flush(&mut gate) {
+            tracing::error!(
+                collection = %self.schema.name,
+                error = %e,
+                "background segment flush failed; the collection remains correct, just holding \
+                 more memory in an unflushed memtable until a later write triggers another attempt"
+            );
+        }
+    }
+
+    /// Runs one flush, seal → build → commit, start to finish — or, if a
+    /// previous attempt's build phase failed, resumes the memtable it
+    /// already sealed rather than sealing a second one (see `flush_gate`'s
+    /// doc comment). Assumes the caller already holds `flush_gate`.
+    ///
+    /// Only the seal and commit stages hold `inner`'s write lock; the build
+    /// stage — encoding the sealed memtable into a segment, the expensive
+    /// part this three-stage split exists for — runs with no lock held at
+    /// all, so searches and writes proceed normally while it's in progress,
+    /// reading the sealed memtable through `inner.frozen` exactly like one
+    /// more (not yet durable) segment. See `snapshot_flush_locked` and
+    /// `commit_flush_locked` for how the two locked stages stay correct
+    /// despite everything that can happen to the collection in between:
+    /// merges committing, documents being deleted or superseded, and so on.
+    fn run_flush(&self, gate: &mut Option<FlushSnapshot>) -> Result<bool> {
+        let snapshot = match gate.take() {
+            Some(snapshot) => snapshot,
+            None => {
+                let mut inner = self.inner.write();
+                match Self::snapshot_flush_locked(
+                    &mut inner,
+                    &self.schema,
+                    &self.layout,
+                    &self.config,
+                )? {
+                    Some(snapshot) => snapshot,
+                    None => return Ok(false),
+                }
+            }
+        };
+
+        let paths = match Self::build_flush(&snapshot, &self.schema, &self.layout) {
+            Ok(paths) => paths,
+            Err(e) => {
+                // The sealed memtable stays live at `inner.frozen`
+                // regardless — only the gate's copy of the snapshot needs
+                // restoring, so the next attempt resumes from here instead
+                // of losing this work or re-sealing over it.
+                *gate = Some(snapshot);
+                return Err(e);
+            }
+        };
+
+        let mut inner = self.inner.write();
+        Self::commit_flush_locked(&mut inner, &self.schema, &self.layout, snapshot, paths)?;
+        Ok(true)
+    }
+
+    /// Stage 1: seal the active memtable — install it at `inner.frozen`
+    /// (still visible to every reader and still deletable, just no longer
+    /// growable) and start a fresh, empty one in its place — and reserve
+    /// everything a concurrent flush attempt could otherwise race with,
+    /// before the lock is released for the build phase.
+    ///
+    /// Returns `Ok(None)` if nothing has been written since the last flush.
+    /// Nothing here can leave `inner` partially mutated: every fallible step
+    /// (fsyncing the outgoing generation, opening the new one) runs before
+    /// anything is actually sealed.
+    fn snapshot_flush_locked(
         inner: &mut Inner,
         schema: &CollectionSchema,
         layout: &Layout,
         config: &EngineConfig,
-    ) -> Result<bool> {
+    ) -> Result<Option<FlushSnapshot>> {
         // Not `memtable.is_empty()`: a memtable can hold zero *live* documents
         // (everything since the last flush was also deleted) while still
         // holding postings and columns that need reclaiming — exactly the
         // case `heap_bytes()`-driven flushing exists to catch.
         if inner.memtable.next_doc_id() == inner.memtable.base() {
-            return Ok(false);
+            return Ok(None);
         }
+        debug_assert!(
+            inner.frozen.is_none(),
+            "flush_gate guarantees at most one sealed-but-uncommitted memtable at a time"
+        );
 
-        let segment_id = inner.state.next_segment_id;
-        let paths = segment_file_paths(layout, &schema.name, segment_id);
-        let mut files = SegmentFiles::create(&paths)?;
-        encode_streaming(
-            &inner.memtable,
-            schema,
-            &mut files.terms,
-            &mut files.ids,
-            &mut files.post,
-            &mut files.col,
-            &mut files.doc,
-        )?;
-        files.commit(&layout.segments_dir(&schema.name))?;
+        // Durable before sealing: under a relaxed sync policy the outgoing
+        // WAL generation may hold acknowledged-but-unsynced records, and
+        // this is the last moment anything forces them to disk before that
+        // generation is (eventually, at commit) retired — after which the
+        // segment this flush produces is their only remaining durable copy.
+        inner.wal.sync()?;
 
-        let new_wal_generation = inner.state.wal_generation + 1;
+        let sealed_generation = inner.state.wal_generation;
+        let new_wal_generation = sealed_generation + 1;
         let new_wal =
             Wal::open(layout.wal_file(&schema.name, new_wal_generation), config.sync_policy)?;
+
+        let segment_id = inner.state.next_segment_id;
+        inner.state.next_segment_id += 1;
 
         // The memtable's own `base()`/`next_doc_id()` span every id it was
         // ever handed, live or not — including holes an off-lock merge
@@ -644,47 +893,122 @@ impl Collection {
         }
         let (min_doc_id, max_doc_id) =
             live_span.unwrap_or((inner.memtable.base(), inner.memtable.next_doc_id() - 1));
+        let doc_count = inner.memtable.len() as u32;
+        let next_doc_id = inner.memtable.next_doc_id();
 
-        let mut new_state = inner.state.clone();
-        new_state.next_segment_id += 1;
-        new_state.next_doc_id = inner.memtable.next_doc_id();
-        new_state.applied_seq = inner.next_seq - 1;
-        new_state.wal_generation = new_wal_generation;
-        new_state.deleted = inner.deleted.iter().collect();
-        new_state.segments.push(SegmentRef {
-            id: segment_id,
-            doc_count: inner.memtable.len() as u32,
+        let sealed =
+            Arc::new(std::mem::replace(&mut inner.memtable, MemTable::new(next_doc_id, schema)));
+        inner.frozen = Some(Arc::clone(&sealed));
+        // The outgoing generation's file is deliberately left on disk here
+        // (unlike the old single-stage flush, which removed it immediately)
+        // — it is still the only durable copy of `sealed`'s records until
+        // this flush commits. `commit_flush_locked` removes it.
+        let _ = std::mem::replace(&mut inner.wal, new_wal);
+
+        Ok(Some(FlushSnapshot {
+            segment_id,
+            memtable: sealed,
+            applied_seq: inner.next_seq - 1,
+            new_wal_generation,
+            doc_count,
             min_doc_id,
             max_doc_id,
+            next_doc_id,
+        }))
+    }
+
+    /// Stage 2: encode the sealed memtable into the output segment's five
+    /// files. No lock held, no `Inner` reference anywhere in this
+    /// function's signature: everything it touches either came from the
+    /// snapshot (immutable once captured — `snapshot.memtable` is an `Arc`
+    /// with no interior mutability) or is freshly created (the output
+    /// files).
+    fn build_flush(
+        snapshot: &FlushSnapshot,
+        schema: &CollectionSchema,
+        layout: &Layout,
+    ) -> Result<SegmentFilePaths> {
+        let paths = segment_file_paths(layout, &schema.name, snapshot.segment_id);
+        let mut files = SegmentFiles::create(&paths)?;
+        encode_streaming(
+            &snapshot.memtable,
+            schema,
+            &mut files.terms,
+            &mut files.ids,
+            &mut files.post,
+            &mut files.col,
+            &mut files.doc,
+        )?;
+        files.commit(&layout.segments_dir(&schema.name))?;
+        Ok(paths)
+    }
+
+    /// Stage 3: commit the flush, re-derived from whatever `inner.state`
+    /// looks like *now* — a concurrent merge may have committed while the
+    /// build phase ran without the lock, and every bit of that must survive
+    /// into this flush's own commit rather than being silently discarded by
+    /// committing a state clone taken at seal time.
+    ///
+    /// Unlike a merge, a flush never renumbers doc ids or needs to remap a
+    /// tombstone — the sealed memtable's ids are exactly the output
+    /// segment's ids, so anything landing on them during the build (a
+    /// delete, an upsert's supersede) is already a valid tombstone under
+    /// the id this segment is about to claim.
+    fn commit_flush_locked(
+        inner: &mut Inner,
+        schema: &CollectionSchema,
+        layout: &Layout,
+        snapshot: FlushSnapshot,
+        paths: SegmentFilePaths,
+    ) -> Result<()> {
+        let mut new_state = inner.state.clone();
+        new_state.applied_seq = snapshot.applied_seq;
+        new_state.wal_generation = snapshot.new_wal_generation;
+        // `max`, not a plain assignment: a concurrent merge may already have
+        // advanced this further (see `swap_merge_locked`'s identical
+        // reasoning) — regressing it would let a future flush's memtable
+        // hand out an id a segment already owns.
+        new_state.next_doc_id = new_state.next_doc_id.max(snapshot.next_doc_id);
+        new_state.deleted = inner.deleted.iter().collect();
+        new_state.segments.push(SegmentRef {
+            id: snapshot.segment_id,
+            doc_count: snapshot.doc_count,
+            min_doc_id: snapshot.min_doc_id,
+            max_doc_id: snapshot.max_doc_id,
         });
 
         // The commit point: a crash before this leaves the previous state
-        // intact and the segment files just written orphaned but harmless,
-        // since nothing outside `state.json` ever names a segment id.
+        // intact and the segment files just written, plus the sealed WAL
+        // generation, orphaned but harmless — the next open replays the
+        // sealed generation from scratch, redoing this same flush.
         meta::write_state(layout, &schema.name, &new_state)?;
 
         // Everything below is the in-memory mirror of what was just made
         // durable. `inner.state` in particular must be kept current, not
-        // just written to disk — the *next* flush reads `inner.state` to
-        // compute `next_segment_id` and to extend `segments`, and a stale
-        // read here would silently drop this segment's `SegmentRef` from
-        // that later write even though its files are still on disk.
+        // just written to disk — the *next* flush or merge reads
+        // `inner.state` to compute its own ids, and a stale read here would
+        // silently drop this segment's `SegmentRef` from that later write
+        // even though its files are still on disk.
         inner.state = new_state;
         inner.segments.push(Arc::new(SegmentReader::open(&paths, schema)?));
-        inner.memtable = MemTable::new(inner.state.next_doc_id, schema);
-        let old_wal = std::mem::replace(&mut inner.wal, new_wal);
+        inner.frozen = None;
 
-        // Last: losing this before the state.json rename would be
-        // unrecoverable (the WAL is the only durable copy), but losing it
-        // after is just a harmless leftover file.
-        old_wal.remove()?;
+        // Cleanup, strictly after the commit: losing this before the
+        // state.json rename would be unrecoverable for a relaxed sync
+        // policy (a lower generation may be the only durable copy of
+        // records this segment now also holds); losing it after is just a
+        // harmless leftover file the next open would otherwise replay for
+        // nothing. Removes every generation below the new one, not just the
+        // one this flush itself sealed, so a leftover from an earlier
+        // failed attempt gets swept up too.
+        for gen in layout.list_wal_generations(&schema.name)? {
+            if gen < snapshot.new_wal_generation {
+                let _ = std::fs::remove_file(layout.wal_file(&schema.name, gen));
+            }
+        }
+        let _ = sync_dir(&layout.wal_dir(&schema.name));
 
-        // Deliberately not triggering a merge from here: this runs under
-        // the write lock, and a merge's own build phase must not (see
-        // `run_merge`'s doc comment) — every caller of `flush_locked` is
-        // responsible for calling `self.maybe_merge()` itself, once its own
-        // lock scope has ended.
-        Ok(true)
+        Ok(())
     }
 
     fn needs_merge_locked(inner: &Inner, config: &EngineConfig) -> bool {
@@ -1021,12 +1345,17 @@ impl Collection {
         Ok(())
     }
 
-    /// Every source a search or suggest request reads through: the memtable,
+    /// Every source a search or suggest request reads through: the active
+    /// memtable, then a sealed-but-uncommitted one if a flush is mid-build,
     /// then every committed segment, oldest first — matching the executor's
-    /// "memtable first, then committed segments" contract.
+    /// "memtable first, then committed segments" contract, with the frozen
+    /// memtable slotting in exactly where its eventual segment will.
     fn sources(inner: &Inner) -> Vec<&dyn IndexSource> {
-        let mut sources: Vec<&dyn IndexSource> = Vec::with_capacity(1 + inner.segments.len());
+        let mut sources: Vec<&dyn IndexSource> = Vec::with_capacity(2 + inner.segments.len());
         sources.push(&inner.memtable);
+        if let Some(frozen) = &inner.frozen {
+            sources.push(frozen.as_ref());
+        }
         sources.extend(inner.segments.iter().map(|s| s.as_ref() as &dyn IndexSource));
         sources
     }
@@ -1036,18 +1365,37 @@ impl Collection {
         if let Some(doc) = inner.memtable.get(doc_id) {
             return Some(doc.source.clone());
         }
+        if let Some(doc) = inner.frozen.as_ref().and_then(|f| f.get(doc_id)) {
+            return Some(doc.source.clone());
+        }
         inner.segments.iter().rev().find_map(|segment| segment.get(doc_id))
     }
 
     /// Resolve a user-facing id to an internal doc id.
     ///
-    /// The memtable holds the newest version of everything written since the
-    /// last flush, so it is consulted first; only then do committed segments,
-    /// newest first. A segment-resident id tombstoned by a later delete must
-    /// never be returned.
+    /// The active memtable holds the newest version of everything written
+    /// since the last flush, so it is consulted first; then a
+    /// sealed-but-uncommitted memtable, if a flush is mid-build; only then
+    /// committed segments, newest first. A tombstoned id must never be
+    /// returned.
+    ///
+    /// A frozen-memtable hit — tombstoned or not — never falls through to
+    /// segments: unlike the active memtable (which never holds a tombstoned
+    /// entry, since `MemTable::remove` deletes in place), a frozen entry can
+    /// be tombstoned by a delete or an upsert's supersede landing after it
+    /// was sealed. But whenever this id was first written into what is now
+    /// the frozen memtable, `apply_upsert` already tombstoned whatever
+    /// segment copy existed at that time — so a live frozen entry means no
+    /// segment can also hold this id live, and a tombstoned one means
+    /// nothing does.
     fn lookup(inner: &Inner, id: &str) -> Option<DocId> {
         if let Some(doc_id) = inner.memtable.lookup(id) {
             return Some(doc_id);
+        }
+        if let Some(frozen) = &inner.frozen {
+            if let Some(doc_id) = frozen.lookup(id) {
+                return (!inner.deleted.contains(doc_id)).then_some(doc_id);
+            }
         }
         inner
             .segments
@@ -1058,9 +1406,11 @@ impl Collection {
     }
 
     /// Insert a document, retiring any previous version of the same id —
-    /// whether that version lives in the memtable or a committed segment.
+    /// whether that version lives in the active memtable, a frozen one, or a
+    /// committed segment.
     fn apply_upsert(
         memtable: &mut MemTable,
+        frozen: Option<&MemTable>,
         deleted: &mut RoaringBitmap,
         segments: &[Arc<SegmentReader>],
         doc: ParsedDocument,
@@ -1072,21 +1422,25 @@ impl Collection {
         memtable.insert(doc);
         if let Some(old) = previous_in_memtable {
             memtable.remove(old);
-        } else {
-            // The previous version, if any, lives in a committed segment —
-            // tombstone it there so the same id doesn't resolve to two
-            // documents (stale in the segment, fresh in the memtable).
-            if let Some(old_doc_id) =
-                segments.iter().rev().find_map(|segment| segment.lookup_id(&id))
-            {
-                deleted.insert(old_doc_id);
-            }
+        } else if let Some(old_doc_id) = frozen.and_then(|f| f.lookup(&id)) {
+            // The previous version lives in a memtable a flush has already
+            // sealed — immutable, so it cannot be removed in place; tombstone
+            // it the same way a committed segment's copy would be.
+            deleted.insert(old_doc_id);
+        } else if let Some(old_doc_id) =
+            segments.iter().rev().find_map(|segment| segment.lookup_id(&id))
+        {
+            // The previous version lives in a committed segment — tombstone
+            // it there so the same id doesn't resolve to two documents
+            // (stale in the segment, fresh in the memtable).
+            deleted.insert(old_doc_id);
         }
     }
 
     /// Retire the current version of `id`, if any. Returns whether it existed.
     fn apply_delete(
         memtable: &mut MemTable,
+        frozen: Option<&MemTable>,
         deleted: &mut RoaringBitmap,
         segments: &[Arc<SegmentReader>],
         id: &str,
@@ -1094,7 +1448,10 @@ impl Collection {
         if let Some(doc_id) = memtable.lookup(id) {
             return memtable.remove(doc_id);
         }
-        let Some(doc_id) = segments.iter().rev().find_map(|segment| segment.lookup_id(id)) else {
+        let doc_id = frozen
+            .and_then(|f| f.lookup(id))
+            .or_else(|| segments.iter().rev().find_map(|segment| segment.lookup_id(id)));
+        let Some(doc_id) = doc_id else {
             return false;
         };
         if deleted.contains(doc_id) {
@@ -1381,6 +1738,23 @@ mod tests {
     }
 
     #[test]
+    fn an_unbounded_memtable_threshold_does_not_overflow_the_backpressure_check() {
+        // `maybe_flush`'s backpressure check multiplies the configured
+        // threshold by `FLUSH_BACKPRESSURE_MULTIPLE` — `usize::MAX` (an
+        // effectively unbounded threshold, e.g. `tachyon-bench`'s default)
+        // must not overflow that multiplication.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.initialize().unwrap();
+        let config = EngineConfig::new(dir.path()).with_max_memtable_docs(usize::MAX);
+
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+        c.upsert(product("1", "a", 1)).unwrap();
+        assert_eq!(c.stats().num_segments, 0, "far below any threshold, unbounded or not");
+        assert_eq!(c.get("1").unwrap()["title"], json!("a"));
+    }
+
+    #[test]
     fn flushed_data_survives_a_restart_with_replay_bounded_to_post_flush_records() {
         let h = Harness::new();
         {
@@ -1526,6 +1900,421 @@ mod tests {
         let suggestions =
             c.suggest(SuggestParams { q: Some("mo".into()), ..Default::default() }).unwrap();
         assert!(!suggestions.suggestions.is_empty());
+    }
+
+    // --- off-lock flush: WAL generation chain ---------------------------
+
+    #[test]
+    fn a_crash_between_a_flushs_seal_and_commit_replays_both_wal_generations() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "Mouse", 100)).unwrap();
+        c.upsert(product("2", "Keyboard", 200)).unwrap();
+
+        // Seal and build, but never commit — simulating a crash after the
+        // WAL generation rolled and the segment was written to disk, but
+        // before state.json ever named it. A third document lands in the
+        // *new* generation while the "old" one is still sealed, exactly
+        // like a write racing a real flush's build phase. `flush_gate` is
+        // held throughout, exactly as `run_flush`'s real callers do, so the
+        // upsert below can't trigger its own (confusingly interleaved)
+        // automatic flush.
+        let gate = c.flush_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_flush_locked(&mut inner, c.schema(), &h.layout, &h.config)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(snapshot.doc_count, 2);
+        Collection::build_flush(&snapshot, c.schema(), &h.layout).unwrap();
+        c.upsert(product("3", "Monitor", 300)).unwrap();
+        drop(snapshot);
+        drop(gate);
+        drop(c); // the "crash": nothing was ever committed
+
+        // Two WAL generations exist on disk; state.json still names only
+        // the first (a flush's commit is what would have advanced it).
+        assert!(h.layout.wal_file("products", 1).exists());
+        assert!(h.layout.wal_file("products", 2).exists());
+
+        let reopened = h.reopen();
+        assert_eq!(
+            reopened.stats().num_segments,
+            0,
+            "the never-committed segment must not be counted"
+        );
+        assert_eq!(reopened.stats().num_documents, 3, "every acknowledged write survived");
+        for (id, title) in [("1", "Mouse"), ("2", "Keyboard"), ("3", "Monitor")] {
+            assert_eq!(reopened.get(id).unwrap()["title"], json!(title));
+        }
+
+        // The collection is fully writable and flushes cleanly from here —
+        // redoing the same flush the crash interrupted.
+        assert!(reopened.flush().unwrap());
+        assert_eq!(reopened.stats().num_segments, 1);
+        assert_eq!(reopened.stats().num_documents, 3);
+
+        let reopened_again = h.reopen();
+        assert_eq!(reopened_again.stats().num_documents, 3);
+        assert_eq!(reopened_again.stats().num_segments, 1);
+        for (id, title) in [("1", "Mouse"), ("2", "Keyboard"), ("3", "Monitor")] {
+            assert_eq!(reopened_again.get(id).unwrap()["title"], json!(title));
+        }
+    }
+
+    #[test]
+    fn a_torn_tail_in_a_non_final_wal_generation_is_corruption() {
+        use std::io::Write;
+
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "Mouse", 100)).unwrap();
+
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_flush_locked(&mut inner, c.schema(), &h.layout, &h.config)
+                .unwrap()
+                .unwrap()
+        };
+        Collection::build_flush(&snapshot, c.schema(), &h.layout).unwrap();
+        drop(snapshot);
+        drop(c);
+
+        // Corrupt the tail of the *sealed*, non-final generation — exactly
+        // what `snapshot_flush_locked`'s seal-time `wal.sync()` should make
+        // impossible in a real crash, since that generation is fsynced
+        // whole before a newer one is ever rolled.
+        let wal_path = h.layout.wal_file("products", 1);
+        let mut file = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&[200u8, 0, 0, 0, 7, 7, 7, 7, 1, 2, 3]).unwrap();
+        drop(file);
+
+        let err = Collection::open(&h.layout, "products", &h.config).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "got {err:?}");
+    }
+
+    // --- off-lock flush races -------------------------------------------
+    //
+    // A flush's build phase (`Collection::build_flush`) runs with no lock
+    // held — the whole point of the off-lock rewrite — so anything that
+    // used to be impossible mid-flush (a write or a merge landing while a
+    // flush is "in progress") is now routine. These tests drive
+    // `snapshot_flush_locked`, `build_flush`, and `commit_flush_locked`
+    // directly rather than through `run_flush`, so each one can land an
+    // exact, deterministic write in the gap between snapshot and commit
+    // instead of hoping a real thread wins a race.
+    //
+    // Each test locks `flush_gate` itself first, exactly as `run_flush`'s
+    // real callers do: without it, the `c.upsert()`/`c.delete()`/`c.merge()`
+    // calls used to simulate "activity during the build phase" would let
+    // `maybe_flush()` run its own *actual* automatic flush (nothing else is
+    // holding the gate to stop it), confusing the very scenario each test
+    // is trying to isolate.
+
+    #[test]
+    fn a_delete_during_the_flush_build_phase_is_not_resurrected() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "a", 1)).unwrap();
+        c.upsert(product("2", "b", 2)).unwrap();
+
+        let _gate = c.flush_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_flush_locked(&mut inner, c.schema(), &h.layout, &h.config)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(snapshot.doc_count, 2);
+
+        // A delete lands "during the build phase": "2" was live when the
+        // memtable was sealed and is already baked into the segment
+        // `build_flush` is about to produce.
+        assert!(c.delete("2").unwrap());
+        assert_eq!(c.stats().num_documents, 1, "the frozen copy is tombstoned immediately");
+
+        let paths = Collection::build_flush(&snapshot, c.schema(), &h.layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::commit_flush_locked(&mut inner, c.schema(), &h.layout, snapshot, paths)
+                .unwrap();
+        }
+        drop(_gate);
+
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.stats().num_documents, 1, "\"2\" must not have been resurrected by the flush");
+        assert!(matches!(c.get("2"), Err(Error::DocumentNotFound { .. })));
+        assert!(c.get("1").is_ok());
+
+        let reopened = h.reopen();
+        assert_eq!(reopened.stats().num_documents, 1);
+        assert!(matches!(reopened.get("2"), Err(Error::DocumentNotFound { .. })));
+    }
+
+    #[test]
+    fn an_upsert_during_the_flush_build_phase_supersedes_the_frozen_copy_without_duplication() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "Old", 100)).unwrap();
+
+        let _gate = c.flush_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_flush_locked(&mut inner, c.schema(), &h.layout, &h.config)
+                .unwrap()
+                .unwrap()
+        };
+
+        // "1"'s old copy is now in the memtable being sealed. This upsert's
+        // new doc id must land in the fresh active memtable, not collide
+        // with the frozen one.
+        c.upsert(product("1", "New", 200)).unwrap();
+        assert_eq!(c.get("1").unwrap()["title"], json!("New"));
+        assert_eq!(c.stats().num_documents, 1, "the supersede must tombstone the frozen copy");
+
+        let paths = Collection::build_flush(&snapshot, c.schema(), &h.layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::commit_flush_locked(&mut inner, c.schema(), &h.layout, snapshot, paths)
+                .unwrap();
+        }
+        drop(_gate);
+
+        assert_eq!(c.get("1").unwrap()["title"], json!("New"));
+        assert_eq!(c.stats().num_documents, 1);
+
+        let reopened = h.reopen();
+        assert_eq!(reopened.get("1").unwrap()["title"], json!("New"));
+        assert_eq!(reopened.stats().num_documents, 1);
+    }
+
+    #[test]
+    fn search_sees_the_frozen_memtable_during_a_flush_build_phase() {
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "Wireless Mouse", 100)).unwrap();
+
+        let _gate = c.flush_gate.lock();
+        let snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_flush_locked(&mut inner, c.schema(), &h.layout, &h.config)
+                .unwrap()
+                .unwrap()
+        };
+        c.upsert(product("2", "Mechanical Keyboard", 200)).unwrap();
+
+        let results = c
+            .search(SearchParams {
+                q: Some("mouse keyboard".into()),
+                match_mode: Some("any".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            results.hits.iter().map(|h| h.document["id"].as_str().unwrap().to_string()).collect();
+        assert!(ids.contains("1"), "the frozen (sealed but uncommitted) document must be found");
+        assert!(ids.contains("2"), "the active memtable's document must be found");
+
+        let paths = Collection::build_flush(&snapshot, c.schema(), &h.layout).unwrap();
+        let mut inner = c.inner.write();
+        Collection::commit_flush_locked(&mut inner, c.schema(), &h.layout, snapshot, paths)
+            .unwrap();
+        drop(inner);
+        drop(_gate);
+    }
+
+    #[test]
+    fn a_merge_committing_during_the_flush_build_phase_does_not_collide_with_it() {
+        let (_dir, layout, config) = merge_harness(2, 2);
+        let c = Collection::create(&layout, schema(), &config).unwrap();
+
+        // Two segments already committed, eligible for a merge.
+        for i in 0..4 {
+            c.upsert(product(&(i + 1).to_string(), "x", i)).unwrap();
+        }
+        assert_eq!(c.stats().num_segments, 2);
+        c.upsert(product("5", "e", 5)).unwrap(); // lands in the fresh active memtable
+
+        let flush_gate = c.flush_gate.lock();
+        let flush_snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_flush_locked(&mut inner, c.schema(), &layout, &config)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(flush_snapshot.doc_count, 1, "only \"5\" had been written since the last flush");
+
+        // A merge runs entirely inside the flush's build phase — folding
+        // the two pre-existing segments together while the flush's own
+        // segment is neither built nor committed yet.
+        let merge_gate = c.merge_gate.lock();
+        let merge_snapshot = {
+            let mut inner = c.inner.write();
+            Collection::snapshot_merge_locked(&mut inner, &config).unwrap()
+        };
+        let merge_built = Collection::build_merge(&merge_snapshot, c.schema(), &layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::swap_merge_locked(
+                &mut inner,
+                c.schema(),
+                &layout,
+                merge_snapshot,
+                merge_built,
+            )
+            .unwrap();
+        }
+        drop(merge_gate);
+        assert_eq!(c.stats().num_segments, 1, "the merge committed on its own");
+
+        let flush_paths = Collection::build_flush(&flush_snapshot, c.schema(), &layout).unwrap();
+        {
+            let mut inner = c.inner.write();
+            Collection::commit_flush_locked(
+                &mut inner,
+                c.schema(),
+                &layout,
+                flush_snapshot,
+                flush_paths,
+            )
+            .unwrap();
+        }
+        drop(flush_gate);
+
+        assert_eq!(c.stats().num_segments, 2, "the merged segment plus the flush's own");
+        assert_eq!(c.stats().num_documents, 5);
+        for id in ["1", "2", "3", "4", "5"] {
+            assert!(c.get(id).is_ok(), "doc {id} must survive");
+        }
+
+        // No id collision between the merge output's range and the flush's.
+        let inner = c.inner.read();
+        let mut ranges: Vec<(DocId, DocId)> =
+            inner.state.segments.iter().map(|s| (s.min_doc_id, s.max_doc_id)).collect();
+        ranges.sort_unstable();
+        for w in ranges.windows(2) {
+            assert!(w[0].1 < w[1].0, "overlapping segment ranges {:?} and {:?}", w[0], w[1]);
+        }
+        drop(inner);
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, 5);
+        for id in ["1", "2", "3", "4", "5"] {
+            assert!(reopened.get(id).is_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_flush_build_leaves_the_sealed_memtable_retryable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let c = h.create();
+        c.upsert(product("1", "Mouse", 100)).unwrap();
+
+        let segments_dir = h.layout.segments_dir("products");
+        std::fs::create_dir_all(&segments_dir).unwrap();
+        std::fs::set_permissions(&segments_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = c.flush();
+        std::fs::set_permissions(&segments_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            err.is_err(),
+            "the build phase must have failed to write into a read-only directory"
+        );
+
+        // The collection is still fully correct — nothing was lost, the
+        // sealed memtable's documents are still visible through `frozen`.
+        assert_eq!(c.stats().num_segments, 0);
+        assert_eq!(c.stats().num_documents, 1);
+        assert_eq!(c.get("1").unwrap()["title"], json!("Mouse"));
+        assert!(
+            c.inner.read().frozen.is_some(),
+            "the sealed memtable must not have been discarded"
+        );
+
+        // The next flush attempt resumes from the same sealed memtable
+        // rather than sealing a second one, and now succeeds.
+        assert!(c.flush().unwrap());
+        assert_eq!(c.stats().num_segments, 1);
+        assert_eq!(c.stats().num_documents, 1);
+        assert!(c.inner.read().frozen.is_none());
+
+        let reopened = h.reopen();
+        assert_eq!(reopened.stats().num_segments, 1);
+        assert_eq!(reopened.get("1").unwrap()["title"], json!("Mouse"));
+    }
+
+    #[test]
+    fn concurrent_writes_and_flushes_leave_the_collection_internally_consistent() {
+        // Real threads, mirroring `concurrent_writes_and_merges_leave_the_
+        // collection_internally_consistent` but forcing explicit flushes
+        // (which block on `flush_gate`, so several threads calling
+        // `c.flush()` concurrently must serialize correctly rather than
+        // double-encoding or losing whichever memtable was sealed first) on
+        // top of the automatic ones every write already triggers.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.initialize().unwrap();
+        let config = EngineConfig::new(dir.path())
+            .with_max_memtable_docs(3)
+            .with_merge_trigger_segments(2)
+            .with_merge_fan_in(2);
+        let c = Arc::new(Collection::create(&layout, schema(), &config).unwrap());
+
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 50;
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let c = Arc::clone(&c);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let id = format!("{t}-{i}");
+                    c.upsert(product(&id, "widget", (t * 1000 + i) as i64)).unwrap();
+                    if i % 5 == 0 {
+                        let victim = format!("{t}-{}", i.saturating_sub(3));
+                        c.delete(&victim).unwrap();
+                    }
+                    if i % 7 == 0 {
+                        c.flush().unwrap();
+                    }
+                    if i % 11 == 0 {
+                        c.merge().unwrap();
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // The same delete pattern each thread ran, replayed here against a
+        // plain `HashSet` instead of the collection — an independent
+        // reference for what should still be alive.
+        let mut expected_alive: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                expected_alive.insert(format!("{t}-{i}"));
+            }
+            for i in (0..PER_THREAD).step_by(5) {
+                expected_alive.remove(&format!("{t}-{}", i.saturating_sub(3)));
+            }
+        }
+
+        for id in &expected_alive {
+            assert!(c.get(id).is_ok(), "expected {id} to be alive");
+        }
+        assert_eq!(c.stats().num_documents, expected_alive.len() as u64);
+
+        let reopened = Collection::open(&layout, "products", &config).unwrap();
+        assert_eq!(reopened.stats().num_documents, expected_alive.len() as u64);
+        for id in &expected_alive {
+            assert!(reopened.get(id).is_ok());
+        }
     }
 
     // --- tiered merges -------------------------------------------------

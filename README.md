@@ -136,34 +136,33 @@ scratch in-memory index before re-encoding it.
 
 Read this before choosing Tachyon.
 
-**A large flush still briefly blocks concurrent search.** Writes are
-durable — they go to a write-ahead log and are replayed on startup — and
-once a memtable crosses `--max-memtable-docs`/`--max-memtable-bytes` it is
-flushed into an immutable, mmap'd on-disk segment: postings, columns, and
-document values are all read lazily and decoded only for what a query
-actually touches, which is what keeps memory bounded by how much of the
-corpus is hot rather than by corpus size. A query fans out across the
-memtable plus every committed segment, so segment count on its own drives
-latency up over time; once a collection holds more than
-`--merge-trigger-segments` (default 8), the smallest `--merge-fan-in`
-(default 4) are folded into one via a streaming k-way merge of the victims'
-already-encoded term dictionaries, postings, columns, and doc stores — no
-document is ever re-parsed or re-tokenized, and nothing beyond one term's
-or one field's worth of data is held in memory at a time. Both the memory
-and the concurrency cost this used to carry are now gone: measured on a
-1M-document, four-segment merge, its own RSS delta averaged ~93 MiB and
-peaked at ~110 MiB (a 5M-document run's overall peak RSS fell from 5.2 GiB
-to roughly 1.5–1.9 GiB, depending on the run), and the merge itself no
-longer holds the collection's write lock for its own duration — only for
-a brief snapshot before it starts and an equally brief commit once it's
-done, with searches and writes proceeding normally in between. What's left
-is the flush that can trigger a merge: encoding a large memtable into a
-segment still runs under the write lock start to finish, so a 1M-document
-flush-under-load run's worst-case concurrent search latency — dominated by
-that, not by merging anymore — fell from 3.7 s (before any of this work)
-to **233 ms**, an 8× reduction, but did not reach zero. An off-lock flush
-would be the natural next step if that residual stall is shown to matter
-in practice.
+**Flushes and merges both stream in bounded memory, off the write lock.**
+Writes are durable — they go to a write-ahead log and are replayed on
+startup — and once a memtable crosses `--max-memtable-docs`/
+`--max-memtable-bytes` it is flushed into an immutable, mmap'd on-disk
+segment: postings, columns, and document values are all read lazily and
+decoded only for what a query actually touches, which is what keeps memory
+bounded by how much of the corpus is hot rather than by corpus size. A
+query fans out across the memtable plus every committed segment, so
+segment count on its own drives latency up over time; once a collection
+holds more than `--merge-trigger-segments` (default 8), the smallest
+`--merge-fan-in` (default 4) are folded into one via a streaming k-way
+merge of the victims' already-encoded term dictionaries, postings, columns,
+and doc stores — no document is ever re-parsed or re-tokenized, and nothing
+beyond one term's or one field's worth of data is held in memory at a time.
+Measured on a 1M-document, four-segment merge, its own RSS delta averaged
+~93 MiB and peaked at ~110 MiB (a 5M-document run's overall peak RSS fell
+from 5.2 GiB to roughly 1.5–1.9 GiB, depending on the run). Both a flush and
+a merge hold the collection's write lock only for a brief snapshot (or
+seal) before their own encode and an equally brief commit after it — never
+for the encode itself — so a search or a write is blocked only for that
+snapshot/commit, not for however long a large flush or merge happens to
+take. Measured on a 1M-document flush-under-load run with continuous
+concurrent search: worst-case search latency fell from 3.7 s (before any of
+this work) to 233 ms once merging alone moved off the lock, then to
+**106 ms** once flushing did too — and, since the lock is now held only for
+a brief moment rather than for the length of an encode, that worst case is
+also markedly less noisy run to run than the numbers it replaced.
 
 **Broad queries no longer visit every match unconditionally.** A block-level
 score bound (true block-max WAND, `.post`'s v3 format) now skips whole

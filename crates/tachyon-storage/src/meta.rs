@@ -39,7 +39,15 @@ pub struct CollectionState {
     /// Every mutation with `seq <= applied_seq` is durably captured in a
     /// segment. Replay skips them.
     pub applied_seq: u64,
-    /// WAL generation currently being appended to.
+    /// Oldest WAL generation not yet fully captured in a committed segment.
+    /// Everything below it has already been superseded by a segment and is
+    /// safe to delete. This is *not* necessarily the generation currently
+    /// being appended to — an in-flight off-lock flush seals the memtable
+    /// and rolls a fresh generation for new writes before that flush
+    /// commits, so recovery may need to replay this generation and the one
+    /// above it, in order, to reconstruct exactly what a crash mid-flush
+    /// left behind. See `Collection::open`'s WAL replay for the chain walk,
+    /// and `Collection::commit_flush_locked` for where this advances.
     pub wal_generation: u64,
     /// Next internal doc id to assign.
     pub next_doc_id: DocId,

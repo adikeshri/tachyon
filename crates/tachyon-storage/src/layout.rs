@@ -76,6 +76,33 @@ impl Layout {
         self.wal_dir(name).join(format!("{generation:010}.wal"))
     }
 
+    /// Every WAL generation number currently on disk for a collection,
+    /// ascending. A collection that predates off-lock flush, or that has
+    /// never flushed, has exactly one.
+    pub fn list_wal_generations(&self, name: &str) -> Result<Vec<u64>> {
+        let dir = self.wal_dir(name);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut gens = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(stem) =
+                Path::new(&file_name).file_stem().and_then(|s| s.to_str()).filter(|_| {
+                    Path::new(&file_name).extension().and_then(|e| e.to_str()) == Some("wal")
+                })
+            else {
+                continue;
+            };
+            if let Ok(gen) = stem.parse::<u64>() {
+                gens.push(gen);
+            }
+        }
+        gens.sort_unstable();
+        Ok(gens)
+    }
+
     pub fn segments_dir(&self, name: &str) -> PathBuf {
         self.collection_dir(name).join(SEGMENTS_DIR)
     }
@@ -198,6 +225,24 @@ mod tests {
 
         std::fs::write(l.marker_file(), "999\n").unwrap();
         assert!(l.initialize().is_err());
+    }
+
+    #[test]
+    fn lists_wal_generations_ascending_and_ignores_stray_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Layout::new(dir.path());
+        std::fs::create_dir_all(l.wal_dir("products")).unwrap();
+        std::fs::write(l.wal_file("products", 3), b"").unwrap();
+        std::fs::write(l.wal_file("products", 1), b"").unwrap();
+        std::fs::write(l.wal_dir("products").join("stray.txt"), b"").unwrap();
+        assert_eq!(l.list_wal_generations("products").unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn lists_no_wal_generations_for_an_unflushed_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Layout::new(dir.path());
+        assert_eq!(l.list_wal_generations("products").unwrap(), Vec::<u64>::new());
     }
 
     #[test]
