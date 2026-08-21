@@ -52,10 +52,14 @@ struct Args {
 
     /// Also run a flush-under-load scenario: a low `--max-memtable-docs` so
     /// segment flushes happen mid-run, with a background thread searching
-    /// continuously, to measure what a flush — which holds the write lock
-    /// for its full duration — costs concurrent readers. Off by default: the
-    /// scenario above stays flush-free on purpose, so its numbers remain a
-    /// stable baseline unaffected by the flush path's own performance.
+    /// continuously, to measure what a flush costs concurrent readers. Since
+    /// off-lock flush, that's no longer "however long the whole encode
+    /// takes" — the write lock is held only for a brief seal before the
+    /// build and an equally brief commit after it, with searches and writes
+    /// proceeding normally in between (mirroring off-lock merge). Off by
+    /// default: the scenario above stays flush-free on purpose, so its
+    /// numbers remain a stable baseline unaffected by the flush path's own
+    /// performance.
     #[arg(long)]
     flush_scenario: bool,
 

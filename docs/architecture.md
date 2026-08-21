@@ -250,16 +250,83 @@ minimum over budget (abandon mid-matrix). Most terms die on the length check.
 
 Each collection is an `RwLock` over its mutable state. Searches take the read
 lock and run concurrently with each other; a write normally holds the write
-lock only for the WAL append and the memtable update, except when it also
-triggers a flush — that runs to completion under the same acquisition (see
-"Segments"), so the occasional write that crosses the memtable threshold
-blocks readers for the length of a segment encode and write rather than a WAL
-append. A flush that goes on to trigger a merge does *not* extend that
-hold any further — see "Merges" below for why, and for what still does.
-This is deliberately simple, and a large flush's own lock hold is the
-obvious place to look next if write throughput under concurrent search
-becomes the bottleneck — an atomically-swapped read snapshot, or streaming
-the flush itself the way a merge now streams, would be the next step.
+lock only for the WAL append and the memtable update. A write that crosses
+the memtable threshold triggers a flush, and a flush that goes on to cross
+the segment-count threshold triggers a merge — neither extends that hold by
+more than a brief snapshot and an equally brief commit; see "Flushes" and
+"Merges" below for how both stay off the lock for their own expensive part.
+
+## Flushes
+
+`Collection::run_flush` (`crates/tachyon-engine/src/collection.rs`) splits a
+flush into three stages, the same shape `run_merge` uses (see "Running off
+the write lock" under "Merges" below), and only the first and third hold
+`inner`'s write lock:
+
+1. **Seal** (locked). Fsync the outgoing WAL generation — under a relaxed
+   sync policy it may hold acknowledged-but-unsynced records, and once this
+   memtable is sealed, the segment this flush produces is their only
+   remaining durable copy once that generation is retired. Then roll a
+   fresh WAL generation for new writes, reserve the output segment id by
+   bumping `state.next_segment_id`, and swap the active memtable for a
+   fresh empty one — the sealed memtable moves to `inner.frozen`, still
+   fully visible to search, lookup, and delete, just no longer growable.
+2. **Build** (unlocked). `encode_streaming` writes the sealed memtable into
+   five new segment files, using only what the snapshot captured — no
+   `Inner` reference anywhere in this stage's call graph. This is the
+   expensive part, and it runs with searches and writes proceeding
+   normally: a search reads the sealed memtable through `inner.frozen`
+   exactly like one more (not yet durable) segment, slotted in right where
+   its eventual segment will sit.
+3. **Commit** (locked). Re-validate against whatever changed while the
+   build ran without the lock — a concurrent merge may have committed a
+   segment or advanced `state.next_doc_id`, so the commit stage clones
+   `inner.state` *fresh* and takes `next_doc_id` as `max(current, sealed)`
+   rather than assigning it outright, mirroring `swap_merge_locked`'s
+   identical reasoning. Then write `state.json`, publish the new segment,
+   clear `inner.frozen`, and delete every WAL generation now below the
+   committed one.
+
+**A flush preserves doc ids; it does not renumber them**, unlike a merge —
+so a delete or an upsert's supersede landing on a frozen document during the
+build is just a tombstone under the id that document already has, with none
+of a merge's rank-based remap needed. `apply_delete` and `apply_upsert`
+check the frozen memtable between the active memtable and committed
+segments; a frozen hit — tombstoned or not — never falls through to check
+segments, since whenever that document was first written into what is now
+the frozen memtable, the same upsert path already tombstoned any segment
+copy that existed at the time.
+
+**Recovery replays a chain of WAL generations, not just one.** A crash
+between a flush's seal and its commit leaves two generations on disk: the
+sealed one, and the fresh one new writes landed in while the build ran.
+`CollectionState::wal_generation` is defined as the *oldest* generation not
+yet captured in a segment, not "the one currently being appended to", so
+`Collection::open` replays every generation from there through whichever is
+highest on disk, in order, reconstructing the same memtable state (and, via
+strictly sequential doc-id assignment during replay, the same doc ids) the
+crashed process held — then does it all again from scratch on every
+subsequent restart until a flush actually commits. Every generation below
+the highest must be fsynced in full before a newer one is ever rolled (the
+seal stage's fsync above), so a torn tail found anywhere but the highest
+generation is treated as corruption rather than a tolerated mid-write crash.
+A stale tombstone this can leave behind — recorded against a sealed
+memtable's *old* doc ids, now orphaned because the crash meant those ids
+were never claimed by a committed segment — is pruned at open time by
+intersecting the tombstone set against every segment's presence bitmap.
+
+At most one flush runs at a time, enforced by `flush_gate`, a
+`Mutex<Option<FlushSnapshot>>` outside `inner`'s own lock — the same
+blocks-vs-skips split `merge_gate` uses for `merge()` vs. `maybe_merge()`
+applies to `flush()` vs. `maybe_flush()`, with one addition: if the build
+stage fails (a full disk, a permissions error), the sealed snapshot is
+handed back into the gate instead of discarded, and the next attempt
+resumes building the same sealed memtable rather than sealing a second one
+or losing the work already captured. `maybe_flush` also does not simply
+skip when the gate is already held if the active memtable has grown past
+`FLUSH_BACKPRESSURE_MULTIPLE`× its ordinary threshold — ingest that
+outruns the build phase blocks on the gate at that point instead, applying
+backpressure rather than letting the memtable grow without bound.
 
 ## Merges
 
@@ -366,10 +433,13 @@ trusting the next write to check again.
 Measured on a 1M-document run (default `merge_trigger_segments`/
 `merge_fan_in`, background searches running the whole time): worst-case
 concurrent search latency during indexing fell from 3.7 s (before any of
-this project) to **233 ms** — an 8× reduction — with what's left dominated
-by a large flush's own lock hold (see "Concurrency" above), not by
-merging, which no longer holds the lock for anything but a snapshot and a
-commit.
+this project) to 233 ms once merging alone went off the write lock — at
+that point dominated by a large flush's own lock hold, not by merging.
+Taking flushes off the lock too (see "Flushes" above) brought the same
+benchmark down to **106 ms**, and — because the lock is now held only for
+a brief seal and commit rather than for however long an encode happens to
+take — markedly less noisy run to run than the flush-dominated number it
+replaced.
 
 ## Score-bound pruning
 
@@ -432,23 +502,3 @@ Measured on the same 5M-document HTTP benchmark, broad query (`any` mode,
 its tail. `match_mode=all`, the default, does even better here (p95 **252
 ms**) since leapfrog intersection narrows the candidate set before the
 bound check ever runs.
-
-## What is not built yet
-
-**Off-lock flushing.** Merging no longer holds the write lock for its own
-duration (see "Running off the write lock" under "Merges" above), but a
-flush still does: encoding a memtable into a segment and writing it runs
-synchronously under the same write-lock hold as the insert or delete that
-crossed the threshold, so every search stalls for a large flush's full
-duration. `encode_streaming` already streams in bounded memory the same
-way a merge's build phase does, so the memory side of this is already
-solved — what a flush would need to become off-lock is the same shape a
-merge now has: reserve the output segment id and doc range up front,
-encode without the lock held, then re-validate and commit. The
-complication is different from a merge's, though — a flush's own memtable
-is exactly what concurrent writes want to keep inserting into, so an
-off-lock flush would need to swap in a fresh memtable for new writes to
-land in *before* the encode starts, rather than after. Deferred until the
-remaining stall (measured at 233 ms worst-case on a 1M-document
-flush-under-load run, down from 3.7 s before any of this work) is shown to
-matter in practice.

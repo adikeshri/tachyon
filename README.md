@@ -99,12 +99,12 @@ broader than real traffic, and deliberately so, because it is the expensive case
 
 | | 100k documents | 1M documents | 5M documents | Target |
 |---|---|---|---|---|
-| Search p95 | **3.4 ms** | 34.4 ms | 175.1 ms | < 30 ms |
-| Search p99 | **4.0 ms** | 35.5 ms | 181.7 ms | < 60 ms |
-| Autocomplete p95 | **0.29 ms** | 0.23 ms | 1.8 ms | < 5 ms |
-| Indexing | **196k docs/sec** | 145k docs/sec | 88k docs/sec | 10k docs/sec |
-| Memory (steady RSS) | 405 MiB | 606 MiB | 895 MiB | — |
-| Memory (peak RSS) | 405 MiB | 646 MiB | 1.5 GiB | — |
+| Search p95 | **3.0 ms** | 33.6 ms | 179.3 ms | < 30 ms |
+| Search p99 | **3.6 ms** | 34.9 ms | 186.1 ms | < 60 ms |
+| Autocomplete p95 | **0.42 ms** | 0.24 ms | 0.83 ms | < 5 ms |
+| Indexing | **199k docs/sec** | 155k docs/sec | 84k docs/sec | 10k docs/sec |
+| Memory (steady RSS) | 404 MiB | 625 MiB | 897 MiB | — |
+| Memory (peak RSS) | 404 MiB | 646 MiB | 1.7 GiB | — |
 
 Both measured right after indexing finishes, before any searches run. Steady
 is current RSS at that point — what's resident most of the time. Peak is
@@ -126,9 +126,10 @@ every scale measured. Search meets the latency target at 100k documents; at
 1M and 5M it misses **on this corpus** — see
 [Known limitations](#known-limitations) — but memory no longer moves in
 lockstep with corpus size the way it used to: peak RSS at 5M documents fell
-from 5.2 GiB to 1.5 GiB after the streaming segment writer and merge
-described below replaced a design that rebuilt each merge's input through a
-scratch in-memory index before re-encoding it.
+from 5.2 GiB to roughly 1.5–1.9 GiB (this run measured 1.7 GiB; it varies
+somewhat run to run) after the streaming segment writer and merge described
+below replaced a design that rebuilt each merge's input through a scratch
+in-memory index before re-encoding it.
 
 ---
 
@@ -136,34 +137,33 @@ scratch in-memory index before re-encoding it.
 
 Read this before choosing Tachyon.
 
-**A large flush still briefly blocks concurrent search.** Writes are
-durable — they go to a write-ahead log and are replayed on startup — and
-once a memtable crosses `--max-memtable-docs`/`--max-memtable-bytes` it is
-flushed into an immutable, mmap'd on-disk segment: postings, columns, and
-document values are all read lazily and decoded only for what a query
-actually touches, which is what keeps memory bounded by how much of the
-corpus is hot rather than by corpus size. A query fans out across the
-memtable plus every committed segment, so segment count on its own drives
-latency up over time; once a collection holds more than
-`--merge-trigger-segments` (default 8), the smallest `--merge-fan-in`
-(default 4) are folded into one via a streaming k-way merge of the victims'
-already-encoded term dictionaries, postings, columns, and doc stores — no
-document is ever re-parsed or re-tokenized, and nothing beyond one term's
-or one field's worth of data is held in memory at a time. Both the memory
-and the concurrency cost this used to carry are now gone: measured on a
-1M-document, four-segment merge, its own RSS delta averaged ~93 MiB and
-peaked at ~110 MiB (a 5M-document run's overall peak RSS fell from 5.2 GiB
-to roughly 1.5–1.9 GiB, depending on the run), and the merge itself no
-longer holds the collection's write lock for its own duration — only for
-a brief snapshot before it starts and an equally brief commit once it's
-done, with searches and writes proceeding normally in between. What's left
-is the flush that can trigger a merge: encoding a large memtable into a
-segment still runs under the write lock start to finish, so a 1M-document
-flush-under-load run's worst-case concurrent search latency — dominated by
-that, not by merging anymore — fell from 3.7 s (before any of this work)
-to **233 ms**, an 8× reduction, but did not reach zero. An off-lock flush
-would be the natural next step if that residual stall is shown to matter
-in practice.
+**Flushes and merges both stream in bounded memory, off the write lock.**
+Writes are durable — they go to a write-ahead log and are replayed on
+startup — and once a memtable crosses `--max-memtable-docs`/
+`--max-memtable-bytes` it is flushed into an immutable, mmap'd on-disk
+segment: postings, columns, and document values are all read lazily and
+decoded only for what a query actually touches, which is what keeps memory
+bounded by how much of the corpus is hot rather than by corpus size. A
+query fans out across the memtable plus every committed segment, so
+segment count on its own drives latency up over time; once a collection
+holds more than `--merge-trigger-segments` (default 8), the smallest
+`--merge-fan-in` (default 4) are folded into one via a streaming k-way
+merge of the victims' already-encoded term dictionaries, postings, columns,
+and doc stores — no document is ever re-parsed or re-tokenized, and nothing
+beyond one term's or one field's worth of data is held in memory at a time.
+Measured on a 1M-document, four-segment merge, its own RSS delta averaged
+~93 MiB and peaked at ~110 MiB (a 5M-document run's overall peak RSS fell
+from 5.2 GiB to roughly 1.5–1.9 GiB, depending on the run). Both a flush and
+a merge hold the collection's write lock only for a brief snapshot (or
+seal) before their own encode and an equally brief commit after it — never
+for the encode itself — so a search or a write is blocked only for that
+snapshot/commit, not for however long a large flush or merge happens to
+take. Measured on a 1M-document flush-under-load run with continuous
+concurrent search: worst-case search latency fell from 3.7 s (before any of
+this work) to 233 ms once merging alone moved off the lock, then to
+**106 ms** once flushing did too — and, since the lock is now held only for
+a brief moment rather than for the length of an encode, that worst case is
+also markedly less noisy run to run than the numbers it replaced.
 
 **Broad queries no longer visit every match unconditionally.** A block-level
 score bound (true block-max WAND, `.post`'s v3 format) now skips whole
