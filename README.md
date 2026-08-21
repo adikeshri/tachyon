@@ -99,12 +99,12 @@ broader than real traffic, and deliberately so, because it is the expensive case
 
 | | 100k documents | 1M documents | 5M documents | Target |
 |---|---|---|---|---|
-| Search p95 | **3.4 ms** | 34.4 ms | 175.1 ms | < 30 ms |
-| Search p99 | **4.0 ms** | 35.5 ms | 181.7 ms | < 60 ms |
-| Autocomplete p95 | **0.29 ms** | 0.23 ms | 1.8 ms | < 5 ms |
-| Indexing | **196k docs/sec** | 145k docs/sec | 88k docs/sec | 10k docs/sec |
-| Memory (steady RSS) | 405 MiB | 606 MiB | 895 MiB | — |
-| Memory (peak RSS) | 405 MiB | 646 MiB | 1.5 GiB | — |
+| Search p95 | **3.0 ms** | 33.6 ms | 179.3 ms | < 30 ms |
+| Search p99 | **3.6 ms** | 34.9 ms | 186.1 ms | < 60 ms |
+| Autocomplete p95 | **0.42 ms** | 0.24 ms | 0.83 ms | < 5 ms |
+| Indexing | **199k docs/sec** | 155k docs/sec | 84k docs/sec | 10k docs/sec |
+| Memory (steady RSS) | 404 MiB | 625 MiB | 897 MiB | — |
+| Memory (peak RSS) | 404 MiB | 646 MiB | 1.7 GiB | — |
 
 Both measured right after indexing finishes, before any searches run. Steady
 is current RSS at that point — what's resident most of the time. Peak is
@@ -126,9 +126,10 @@ every scale measured. Search meets the latency target at 100k documents; at
 1M and 5M it misses **on this corpus** — see
 [Known limitations](#known-limitations) — but memory no longer moves in
 lockstep with corpus size the way it used to: peak RSS at 5M documents fell
-from 5.2 GiB to 1.5 GiB after the streaming segment writer and merge
-described below replaced a design that rebuilt each merge's input through a
-scratch in-memory index before re-encoding it.
+from 5.2 GiB to roughly 1.5–1.9 GiB (this run measured 1.7 GiB; it varies
+somewhat run to run) after the streaming segment writer and merge described
+below replaced a design that rebuilt each merge's input through a scratch
+in-memory index before re-encoding it.
 
 ---
 
