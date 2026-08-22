@@ -1,0 +1,13 @@
+rust:
+  - crates/**
+
+docs:
+  - docs/**
+  - "**/*.md"
+
+ci:
+  - .github/**
+
+docker:
+  - Dockerfile
+  - .dockerignore
