@@ -1,6 +1,7 @@
 # Contributing to Tachyon
 
-Thanks for wanting to help.
+Thanks for wanting to help. Participation is covered by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Getting set up
 

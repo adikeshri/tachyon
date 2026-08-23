@@ -237,8 +237,13 @@ tachyon-core     schema, values, documents, errors
 
 Issues and pull requests are welcome. Substantial changes should start as an
 RFC issue so the design can be discussed before the code is written. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+Found a security issue? See [`SECURITY.md`](SECURITY.md) instead of opening
+a public issue.
 
 ## License
 
-Apache 2.0. See [`LICENSE`](LICENSE).
+Apache 2.0. See [`LICENSE`](LICENSE). Changes are tracked in
+[`CHANGELOG.md`](CHANGELOG.md).
