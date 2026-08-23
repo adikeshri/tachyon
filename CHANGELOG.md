@@ -7,11 +7,15 @@ Tachyon is pre-1.0 (crate version stays `0.1.0`); the versions below are the
 Docker image tags on [Docker Hub](https://hub.docker.com/r/adikeshri/tachyon)
 that `adikeshri/tachyon:latest` has pointed to, not semver crate releases.
 
-## [Unreleased]
+## [4.2.1] — 2026-08-23
 
-- Dependency and CI maintenance: Alpine base image, `actions/labeler`,
-  `docker/setup-buildx-action`, `docker/metadata-action`, and a Dependabot
-  config covering cargo, GitHub Actions, and Docker.
+### Changed
+
+- Runtime base image bumped `alpine:3.21` → `3.24`.
+
+### Fixed
+
+- `docker run` command corrected in the README quickstart.
 
 ## [4.2.0] — 2026-08-22
 
@@ -83,7 +87,7 @@ ranges, set membership, `&&`, `||`); facets; multi-clause sorting; query
 analytics; Prometheus metrics; API key auth; a crash-safe write path backed
 by a write-ahead log; and a single-binary Docker image.
 
-[Unreleased]: https://github.com/adikeshri/tachyon/compare/v4.2.0...HEAD
+[4.2.1]: https://github.com/adikeshri/tachyon/compare/v4.2.0...v4.2.1
 [4.2.0]: https://github.com/adikeshri/tachyon/compare/v4.1.0...v4.2.0
 [4.1.0]: https://github.com/adikeshri/tachyon/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/adikeshri/tachyon/compare/v3.0.0...v4.0.0
