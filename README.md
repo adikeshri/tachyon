@@ -11,7 +11,7 @@ filters, facets, sorting, and autocomplete — to your application in under five
 minutes. It is not a vector database and not a RAG engine; it does one thing.
 
 ```bash
-docker run -p 8108:8108 ghcr.io/tachyon-search/tachyon:latest
+docker run -p 8108:8108 -v tachyon-data:/data adikeshri/tachyon:latest
 ```
 
 > See [Known limitations](#known-limitations) before you rely on it.

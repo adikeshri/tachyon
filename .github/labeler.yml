@@ -1,13 +1,19 @@
 rust:
-  - crates/**
+  - changed-files:
+      - any-glob-to-any-file: crates/**
 
 docs:
-  - docs/**
-  - "**/*.md"
+  - changed-files:
+      - any-glob-to-any-file:
+          - docs/**
+          - "**/*.md"
 
 ci:
-  - .github/**
+  - changed-files:
+      - any-glob-to-any-file: .github/**
 
 docker:
-  - Dockerfile
-  - .dockerignore
+  - changed-files:
+      - any-glob-to-any-file:
+          - Dockerfile
+          - .dockerignore
