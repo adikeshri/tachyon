@@ -7,6 +7,21 @@ Tachyon is pre-1.0 (crate version stays `0.1.0`); the versions below are the
 Docker image tags on [Docker Hub](https://hub.docker.com/r/adikeshri/tachyon)
 that `adikeshri/tachyon:latest` has pointed to, not semver crate releases.
 
+## [4.3.0] — 2026-09-12
+
+### Performance
+
+- Filters are checked per document as a search visits it, instead of being
+  materialized into a bitmap over the whole collection on every query. A
+  filter that matches a broad slice of the collection (`price:<25000 &&
+  rating:>2.0` in the benchmark, ~30% of the corpus) used to cost O(collection
+  size) regardless of how few documents the search itself ever visited,
+  which made filtered search slower than unfiltered search despite matching
+  fewer documents. Measured on a 1M-document benchmark: `Search + filter`
+  mean latency fell from 23.5 ms (worse than the unfiltered 15.7 ms) to
+  15.7 ms (matching it), and its worst-case latency fell from 531 ms to
+  47 ms.
+
 ## [4.2.1] — 2026-08-23
 
 ### Changed
@@ -87,6 +102,7 @@ ranges, set membership, `&&`, `||`); facets; multi-clause sorting; query
 analytics; Prometheus metrics; API key auth; a crash-safe write path backed
 by a write-ahead log; and a single-binary Docker image.
 
+[4.3.0]: https://github.com/adikeshri/tachyon/compare/v4.2.1...v4.3.0
 [4.2.1]: https://github.com/adikeshri/tachyon/compare/v4.2.0...v4.2.1
 [4.2.0]: https://github.com/adikeshri/tachyon/compare/v4.1.0...v4.2.0
 [4.1.0]: https://github.com/adikeshri/tachyon/compare/v4.0.0...v4.1.0

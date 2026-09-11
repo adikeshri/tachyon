@@ -33,10 +33,10 @@
 //! A document with no brand at all is not "not Razer", it is unknown, and
 //! returning it from a negation surprises people more often than it helps.
 
-use roaring::RoaringBitmap;
+use std::borrow::Cow;
 
 use tachyon_core::{CollectionSchema, Error, FieldId, FieldType, Result, Value};
-use tachyon_index::{IndexSource, NumKey};
+use tachyon_index::NumKey;
 
 /// A parsed filter tree.
 #[derive(Debug, Clone, PartialEq)]
@@ -358,111 +358,31 @@ fn expect_num(value: FilterValue, name: &str) -> Result<NumKey> {
     }
 }
 
-/// Evaluate a filter into the set of matching doc ids.
+/// Evaluate a filter against one document's own field values.
 ///
-/// Each source contributes its own matches and they are unioned, because a doc
-/// id belongs to exactly one source.
-pub fn evaluate(expr: &FilterExpr, sources: &[&dyn IndexSource]) -> RoaringBitmap {
+/// Deliberately per-document rather than pre-materialized into a bitmap over
+/// the whole collection: a search only ever needs the filter's verdict on the
+/// documents it actually visits (bounded by the query's own selectivity), and
+/// a broad filter predicate — say, one that matches a third of the collection
+/// — costs nothing here that scales with the collection's size, only with how
+/// many documents the caller asks about. `value_of` resolves one field to its
+/// (possibly multi-valued) value, however the caller wants to fetch it — a
+/// document store lookup, a column read, or a fixture's own map.
+pub fn matches<'a>(
+    expr: &FilterExpr,
+    value_of: &mut impl FnMut(FieldId) -> Option<Cow<'a, Value>>,
+) -> bool {
     match expr {
-        FilterExpr::And(terms) => {
-            let mut iter = terms.iter();
-            let Some(first) = iter.next() else {
-                return RoaringBitmap::new();
-            };
-            let mut acc = evaluate(first, sources);
-            for term in iter {
-                if acc.is_empty() {
-                    // Nothing left to intersect with; skip the remaining work.
-                    break;
-                }
-                acc &= evaluate(term, sources);
-            }
-            acc
-        }
-        FilterExpr::Or(terms) => {
-            let mut acc = RoaringBitmap::new();
-            for term in terms {
-                acc |= evaluate(term, sources);
-            }
-            acc
-        }
+        FilterExpr::And(terms) => terms.iter().all(|t| matches(t, value_of)),
+        FilterExpr::Or(terms) => terms.iter().any(|t| matches(t, value_of)),
         FilterExpr::Pred(predicate) => {
-            let mut acc = RoaringBitmap::new();
-            for source in sources {
-                acc |= eval_predicate(predicate, *source);
-            }
-            acc
+            let value = value_of(predicate.field);
+            matches_value(&predicate.op, value.as_deref().unwrap_or(&Value::Null))
         }
     }
 }
 
-fn eval_predicate(predicate: &Predicate, source: &dyn IndexSource) -> RoaringBitmap {
-    let field = predicate.field;
-
-    // A field can have a numeric column or a keyword one, never both.
-    if let Some(numeric) = source.numeric_column(field) {
-        return match &predicate.op {
-            PredOp::Eq(FilterValue::Num(k)) => numeric.range(Some(*k), Some(*k)),
-            PredOp::Ne(FilterValue::Num(k)) => numeric.not_equal(*k),
-            PredOp::Lt(k) => numeric.less_than(*k),
-            PredOp::Le(k) => numeric.range(None, Some(*k)),
-            PredOp::Gt(k) => numeric.greater_than(*k),
-            PredOp::Ge(k) => numeric.range(Some(*k), None),
-            PredOp::Range(lo, hi) => numeric.range(Some(*lo), Some(*hi)),
-            PredOp::In(values) => {
-                let mut acc = RoaringBitmap::new();
-                for value in values {
-                    if let FilterValue::Num(k) = value {
-                        acc |= numeric.range(Some(*k), Some(*k));
-                    }
-                }
-                acc
-            }
-            PredOp::NotIn(values) => {
-                let mut excluded = RoaringBitmap::new();
-                for value in values {
-                    if let FilterValue::Num(k) = value {
-                        excluded |= numeric.range(Some(*k), Some(*k));
-                    }
-                }
-                numeric.present() - excluded
-            }
-            // Type mismatches are rejected during parsing.
-            PredOp::Eq(_) | PredOp::Ne(_) => RoaringBitmap::new(),
-        };
-    }
-
-    if let Some(keyword) = source.keyword_column(field) {
-        return match &predicate.op {
-            PredOp::Eq(FilterValue::Text(v)) => keyword.equals(v),
-            PredOp::Ne(FilterValue::Text(v)) => keyword.not_equal(v),
-            PredOp::In(values) => {
-                let mut acc = RoaringBitmap::new();
-                for value in values {
-                    if let FilterValue::Text(v) = value {
-                        acc |= keyword.equals(v);
-                    }
-                }
-                acc
-            }
-            PredOp::NotIn(values) => {
-                let mut excluded = RoaringBitmap::new();
-                for value in values {
-                    if let FilterValue::Text(v) = value {
-                        excluded |= keyword.equals(v);
-                    }
-                }
-                keyword.present() - excluded
-            }
-            _ => RoaringBitmap::new(),
-        };
-    }
-
-    RoaringBitmap::new()
-}
-
-/// The `Value`-level test a predicate applies, exposed for callers that hold a
-/// document rather than a column.
+/// The `Value`-level test a predicate applies.
 pub fn matches_value(op: &PredOp, value: &Value) -> bool {
     let nums = || value.iter_scalars().filter_map(NumKey::from_value);
     let texts = || value.iter_scalars().filter_map(Value::as_str);

@@ -28,13 +28,12 @@
 //! pre-pruning accumulator used, so a query too small to trigger any bound
 //! check scores identically to before this file existed.
 
-use roaring::RoaringBitmap;
-
 use tachyon_core::{DocId, FieldId};
 use tachyon_index::{MergeCursor, PostingCursor};
 
 use crate::bm25::{self, FieldStats};
 use crate::executor::{sort_values, Ranked, SearchContext, TermCandidate, TopKByScore};
+use crate::filter::{self, FilterExpr};
 use crate::query_text::ParsedQuery;
 use crate::request::SearchRequest;
 use crate::score::{self, ScoreComponents, ScoreWeights};
@@ -395,7 +394,7 @@ impl DocEvidence {
 pub(crate) struct DocScorer<'a> {
     ctx: &'a SearchContext<'a>,
     req: &'a SearchRequest,
-    filter: Option<&'a RoaringBitmap>,
+    filter: Option<&'a FilterExpr>,
     weights: ScoreWeights,
     max_boost: f32,
     max_field_boost: f32,
@@ -413,7 +412,7 @@ impl<'a> DocScorer<'a> {
     pub(crate) fn new(
         ctx: &'a SearchContext<'a>,
         req: &'a SearchRequest,
-        filter: Option<&'a RoaringBitmap>,
+        filter: Option<&'a FilterExpr>,
         allowed_edits: u32,
         needs_positions: bool,
         num_tokens: usize,
@@ -623,7 +622,13 @@ fn visit_and_score(
     top_k: &mut Option<TopKByScore>,
     candidates: &mut Vec<Ranked>,
 ) {
-    if !scorer.ctx.is_live(doc_id) || scorer.filter.is_some_and(|f| !f.contains(doc_id)) {
+    if !scorer.ctx.is_live(doc_id) {
+        return;
+    }
+    if scorer
+        .filter
+        .is_some_and(|expr| !filter::matches(expr, &mut |field| scorer.ctx.value(doc_id, field)))
+    {
         return;
     }
 
@@ -849,6 +854,7 @@ pub(crate) fn run_conjunctive(
 mod tests {
     use super::*;
 
+    use roaring::RoaringBitmap;
     use serde_json::json;
     use tachyon_core::{CollectionSchema, FieldSchema, FieldType, ParsedDocument};
     use tachyon_index::MemTable;

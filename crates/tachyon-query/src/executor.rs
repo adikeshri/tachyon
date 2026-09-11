@@ -204,11 +204,12 @@ pub struct SearchOutcome {
 
 /// Run a search.
 ///
-/// Filters are evaluated first, into a bitmap, so the pruning walk can
-/// reject a document before ever resolving it.
+/// The filter, if any, is checked per document as the driver visits it —
+/// cheaper than materializing it into a bitmap up front, since a broad
+/// filter predicate would otherwise cost O(collection size) on every query
+/// regardless of how few documents the query itself ever visits.
 pub fn execute(ctx: &SearchContext, req: &SearchRequest) -> SearchOutcome {
-    let filter_set = req.filter_expr.as_ref().map(|expr| filter::evaluate(expr, &ctx.sources));
-    let filter = filter_set.as_ref();
+    let filter = req.filter_expr.as_ref();
 
     let query = query_text::parse(&req.q);
     let tokens = &query.tokens;
@@ -363,7 +364,7 @@ impl TopKByScore {
 fn match_all(
     ctx: &SearchContext,
     req: &SearchRequest,
-    filter: Option<&RoaringBitmap>,
+    filter: Option<&filter::FilterExpr>,
 ) -> SearchOutcome {
     let mut matched = RoaringBitmap::new();
     let mut candidates = Vec::new();
@@ -373,7 +374,9 @@ fn match_all(
             if !source.is_live(doc_id) || ctx.deleted.contains(doc_id) {
                 continue;
             }
-            if filter.is_some_and(|f| !f.contains(doc_id)) {
+            if filter
+                .is_some_and(|expr| !filter::matches(expr, &mut |field| ctx.value(doc_id, field)))
+            {
                 continue;
             }
             matched.insert(doc_id);
