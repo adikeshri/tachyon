@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 tower-http = { version = "0.7", features = ["trace"] }
 clap = { version = "4", features = ["derive", "env"] }
 parking_lot.workspace = true
-utoipa = { version = "5.5.0", features = ["axum_extras"] }
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
 [dev-dependencies]
