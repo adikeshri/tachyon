@@ -12,4 +12,4 @@ authors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-utoipa = "5.5.0"
+utoipa = "6.0.0"

@@ -18,7 +18,7 @@ serde_json.workspace = true
 parking_lot.workspace = true
 roaring.workspace = true
 tracing.workspace = true
-utoipa = "5.5.0"
+utoipa = "6.0.0"
 
 [dev-dependencies]
 tempfile.workspace = true
